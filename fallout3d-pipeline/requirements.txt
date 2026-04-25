@@ -1,0 +1,11 @@
+PyQt6>=6.4.0
+PyQt6-Qt6>=6.4.0
+PyQt6-sip>=13.4.0
+numpy>=1.23.0
+opencv-python>=4.7.0
+mediapipe>=0.10.0
+scipy>=1.10.0
+Pillow>=9.4.0
+pygltflib>=1.15.0
+pyqtgraph>=0.13.3
+PyOpenGL>=3.1.6
