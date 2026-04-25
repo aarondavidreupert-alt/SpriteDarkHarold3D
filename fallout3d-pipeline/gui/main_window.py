@@ -67,6 +67,8 @@ class AppState(QObject):
         self.pose_library = PoseLibrary()
         self.selected_idx: int = -1
         self.current_frame: int = 0
+        self.palette: Optional[np.ndarray] = None   # (256, 3) uint8
+        self.palette_path: str = ""
         self.assets_dir: str = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "assets", "templates",
