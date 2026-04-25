@@ -1,0 +1,277 @@
+"""
+PoseTriangulator — MediaPipe pose detection across 6 isometric views,
+with flip correction, per-landmark confidence weighting, and triangulation.
+"""
+
+import math
+import numpy as np
+import cv2
+
+from .isometric_camera_setup5 import IsometricCameraSetup
+
+# MediaPipe is optional at import time so the pipeline can load without a GPU.
+try:
+    import mediapipe as mp
+    _MP_AVAILABLE = True
+except ImportError:
+    _MP_AVAILABLE = False
+
+# -----------------------------------------------------------------------
+# Skeleton connectivity
+# -----------------------------------------------------------------------
+
+POSE_CONNECTIONS = [
+    (11, 12), (11, 23), (12, 24), (23, 24),   # torso
+    (11, 13), (13, 15), (12, 14), (14, 16),   # arms
+    (23, 25), (25, 27), (24, 26), (26, 28),   # legs
+    (0, 1), (1, 2), (2, 3), (3, 7),
+    (0, 4), (4, 5), (5, 6), (6, 8),           # face
+]
+
+LANDMARK_BODY_PART = {**{i: "face" for i in range(11)},
+                      **{i: "torso" for i in [11, 12, 23, 24]},
+                      **{i: "arms" for i in [13, 14, 15, 16]},
+                      **{i: "legs" for i in [25, 26, 27, 28]}}
+
+PART_COLORS = {
+    "face":  (255, 0, 255),
+    "torso": (0, 255, 0),
+    "arms":  (0, 0, 255),
+    "legs":  (255, 255, 0),
+}
+
+# Pairs that get swapped on a left/right flip
+_FLIP_PAIRS = [(11, 12), (13, 14), (15, 16), (23, 24),
+               (7, 8), (9, 10), (1, 4), (2, 5), (3, 6)]
+
+
+def _normalized_to_pixel(nx, ny, w, h):
+    px = min(math.floor(nx * w), w - 1)
+    py = min(math.floor(ny * h), h - 1)
+    return max(0, px), max(0, py)
+
+
+class PoseTriangulator:
+    """
+    Detects 2D MediaPipe poses in each of the 6 isometric views,
+    corrects left/right flips per perspective, and triangulates to 3D.
+
+    Usage
+    -----
+    t = PoseTriangulator()
+    t.load_animation_sequence(numpy_array)   # shape (6, N, H, W, 3)
+    t.detect_poses_sequence()
+    skeleton_3d = t.triangulate_sequence()   # shape (N, 33, 3)
+    """
+
+    def __init__(self, image_size=(400, 400)):
+        self.camera_setup = IsometricCameraSetup(
+            radius=2.0, height=1.5, focal_length=500,
+            image_size=image_size, subject_height=0.3,
+        )
+        self.frames: np.ndarray | None = None          # (6, N, H, W, 3)
+        self.poses_sequence: np.ndarray | None = None  # (N, 6, 33, 3)
+
+        self._pose_detector = None  # lazy-initialised
+
+    # ------------------------------------------------------------------
+    # MediaPipe
+    # ------------------------------------------------------------------
+
+    def _get_detector(self):
+        if self._pose_detector is None:
+            if not _MP_AVAILABLE:
+                raise RuntimeError("mediapipe is not installed.")
+            mp_pose = mp.solutions.pose
+            self._pose_detector = mp_pose.Pose(
+                static_image_mode=False,
+                model_complexity=2,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        return self._pose_detector
+
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
+    def load_animation_sequence(self, array: np.ndarray):
+        """Accept array of shape (6, N, H, W, 3) or (6, N, H, W)."""
+        self.frames = array
+        self.poses_sequence = None
+
+    # ------------------------------------------------------------------
+    # Flip correction
+    # ------------------------------------------------------------------
+
+    def _correct_flip(self, pose_2d: np.ndarray, perspective_idx: int) -> np.ndarray:
+        """Swap left/right landmarks if the shoulder direction is mirrored."""
+        angle = perspective_idx * 60
+        expected = np.array([np.cos(np.radians(angle)), np.sin(np.radians(angle))])
+        left_sh, right_sh = pose_2d[11], pose_2d[12]
+
+        if np.all(left_sh == 0) or np.all(right_sh == 0):
+            return pose_2d
+
+        seg = right_sh[:2] - left_sh[:2]
+        if np.dot(seg, expected) >= 0:
+            return pose_2d
+
+        corrected = pose_2d.copy()
+        for l, r in _FLIP_PAIRS:
+            corrected[l], corrected[r] = corrected[r].copy(), corrected[l].copy()
+        return corrected
+
+    # ------------------------------------------------------------------
+    # Detection
+    # ------------------------------------------------------------------
+
+    def detect_poses_sequence(self, progress_cb=None):
+        """Run MediaPipe on every (frame, perspective) pair.
+
+        Parameters
+        ----------
+        progress_cb : callable(int, int) | None
+            Called with (current_frame, total_frames) for progress reporting.
+        """
+        detector = self._get_detector()
+        n_perspectives, n_frames = self.frames.shape[0], self.frames.shape[1]
+        all_poses = []
+
+        for frame_idx in range(n_frames):
+            if progress_cb:
+                progress_cb(frame_idx, n_frames)
+
+            frame_poses = []
+            for persp_idx in range(n_perspectives):
+                img = self.frames[persp_idx, frame_idx]
+                h, w = img.shape[:2]
+
+                if img.dtype != np.uint8:
+                    img = (np.clip(img, 0, 1) * 255).astype(np.uint8) if img.max() <= 1 else img.astype(np.uint8)
+                if len(img.shape) == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                elif img.shape[2] == 4:
+                    img = img[:, :, :3]
+
+                results = detector.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+                if results.pose_landmarks:
+                    lms = np.array([
+                        [*_normalized_to_pixel(lm.x, lm.y, w, h), lm.z]
+                        for lm in results.pose_landmarks.landmark
+                    ], dtype=float)
+                    lms = self._correct_flip(lms, persp_idx)
+                else:
+                    lms = np.zeros((33, 3))
+
+                frame_poses.append(lms)
+
+            all_poses.append(np.array(frame_poses))  # (6, 33, 3)
+
+        self.poses_sequence = np.array(all_poses)     # (N, 6, 33, 3)
+        if progress_cb:
+            progress_cb(n_frames, n_frames)
+
+    # ------------------------------------------------------------------
+    # Triangulation
+    # ------------------------------------------------------------------
+
+    def triangulate_sequence(self) -> np.ndarray:
+        """Triangulate each landmark across all views for every frame.
+
+        Returns
+        -------
+        np.ndarray of shape (N, 33, 3)
+        """
+        if self.poses_sequence is None:
+            raise ValueError("Run detect_poses_sequence() first.")
+
+        out = []
+        for frame_poses in self.poses_sequence:   # (6, 33, 3)
+            frame_3d = []
+            for lm_idx in range(33):
+                views, weights = {}, {}
+                for v_idx, pose in enumerate(frame_poses):
+                    lm = pose[lm_idx]
+                    if not np.all(lm == 0):
+                        views[f"ISO-{v_idx + 1}"] = lm[:2]
+                        weights[f"ISO-{v_idx + 1}"] = max(0.05, float(lm[2]))
+                if len(views) >= 2:
+                    pt3d = self.camera_setup.triangulate_point(views, weights)
+                else:
+                    pt3d = np.zeros(3)
+                frame_3d.append(pt3d)
+            out.append(np.array(frame_3d))
+
+        return np.array(out)    # (N, 33, 3)
+
+    # ------------------------------------------------------------------
+    # Manual landmark correction
+    # ------------------------------------------------------------------
+
+    def set_landmark(self, frame_idx: int, view_idx: int, lm_idx: int, xy: np.ndarray):
+        """Override a single 2D landmark position (in pixel coords)."""
+        if self.poses_sequence is None:
+            return
+        self.poses_sequence[frame_idx, view_idx, lm_idx, :2] = xy
+
+    def get_backprojection_error(self, frame_idx: int, skeleton_3d: np.ndarray) -> np.ndarray:
+        """Return per-landmark reprojection error (mean over all views), shape (33,)."""
+        bp_views = self.camera_setup.back_project_points(skeleton_3d)  # list of 6 × (33, 3)
+        errors = np.zeros(33)
+        for v_idx in range(6):
+            orig = self.poses_sequence[frame_idx, v_idx]   # (33, 3)
+            bp = bp_views[v_idx]                            # (33, 3)
+            for lm_idx in range(33):
+                if not np.all(orig[lm_idx] == 0):
+                    errors[lm_idx] += np.linalg.norm(orig[lm_idx, :2] - bp[lm_idx, :2])
+        return errors / 6
+
+    # ------------------------------------------------------------------
+    # Visualisation helpers
+    # ------------------------------------------------------------------
+
+    def overlay_pose_on_image(
+        self, image: np.ndarray, pose_2d: np.ndarray,
+        frame_idx: int = 0, perspective_idx: int = 0
+    ) -> np.ndarray:
+        img = image.copy()
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+
+        connections = [
+            (11, 12, "torso"), (12, 24, "torso"), (24, 23, "torso"), (23, 11, "torso"),
+            (11, 13, "arms"), (13, 15, "arms"), (12, 14, "arms"), (14, 16, "arms"),
+            (23, 25, "legs"), (25, 27, "legs"), (24, 26, "legs"), (26, 28, "legs"),
+        ]
+        for s, e, part in connections:
+            if not (np.all(pose_2d[s] == 0) or np.all(pose_2d[e] == 0)):
+                cv2.line(img, tuple(pose_2d[s, :2].astype(int)),
+                         tuple(pose_2d[e, :2].astype(int)), PART_COLORS[part], 2)
+        for i, pt in enumerate(pose_2d):
+            if not np.all(pt == 0):
+                cv2.circle(img, tuple(pt[:2].astype(int)), 3, (255, 255, 255), -1)
+
+        cv2.putText(img, f"F{frame_idx} V{perspective_idx + 1}", (10, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        return img
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def export_animation_data(self, skeleton_3d: np.ndarray, path: str = "animation_data.json"):
+        import json
+        data = {
+            "metadata": {
+                "total_frames": int(skeleton_3d.shape[0]),
+                "perspectives": 6,
+                "image_size": list(self.camera_setup.image_size),
+                "landmarks_per_pose": 33,
+            },
+            "poses_2d": self.poses_sequence.tolist() if self.poses_sequence is not None else [],
+            "poses_3d": skeleton_3d.tolist(),
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
