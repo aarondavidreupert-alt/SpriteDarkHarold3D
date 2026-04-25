@@ -136,6 +136,7 @@ class MainWindow(QMainWindow):
         from gui.reconstruction_tab import ReconstructionTab
         from gui.pose_library_tab import PoseLibraryTab
         from gui.mesh_tab import MeshTab
+        from gui.animation_tab import AnimationTab
         from gui.export_tab import ExportTab
 
         self.tabs = QTabWidget()
@@ -147,14 +148,16 @@ class MainWindow(QMainWindow):
         self.tab_recon       = ReconstructionTab(self.state, self)
         self.tab_library     = PoseLibraryTab(self.state, self)
         self.tab_mesh        = MeshTab(self.state, self)
+        self.tab_animation   = AnimationTab(self.state, self)
         self.tab_export      = ExportTab(self.state, self)
 
-        self.tabs.addTab(self.tab_asset,   "1 · Asset Loader")
-        self.tabs.addTab(self.tab_pose,    "2 · Pose Editor")
-        self.tabs.addTab(self.tab_recon,   "3 · 3D Reconstruction")
-        self.tabs.addTab(self.tab_library, "4 · Pose Library")
-        self.tabs.addTab(self.tab_mesh,    "5 · Mesh & Normals")
-        self.tabs.addTab(self.tab_export,  "6 · Export")
+        self.tabs.addTab(self.tab_asset,     "1 · Asset Loader")
+        self.tabs.addTab(self.tab_pose,      "2 · Pose Editor")
+        self.tabs.addTab(self.tab_recon,     "3 · 3D Reconstruction")
+        self.tabs.addTab(self.tab_library,   "4 · Pose Library")
+        self.tabs.addTab(self.tab_mesh,      "5 · Mesh & Normals")
+        self.tabs.addTab(self.tab_animation, "6 · Animation Synthesis")
+        self.tabs.addTab(self.tab_export,    "7 · Export")
 
         self.setCentralWidget(self.tabs)
 
@@ -190,10 +193,15 @@ class MainWindow(QMainWindow):
         ))
         tb.addAction(act_tri)
 
-        act_exp = QAction("Export GLB…", self)
+        act_anim = QAction("Synthesise Animation", self)
+        act_anim.setShortcut("Ctrl+A")
+        act_anim.triggered.connect(lambda: self.tabs.setCurrentIndex(5))
+        tb.addAction(act_anim)
+
+        act_exp = QAction("Export…", self)
         act_exp.setShortcut("Ctrl+E")
         act_exp.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(5),
+            self.tabs.setCurrentIndex(6),
             self.tab_export.export_glb(),
         ))
         tb.addAction(act_exp)
@@ -205,7 +213,8 @@ class MainWindow(QMainWindow):
             "Run 3D triangulation and inspect skeleton",
             "Average poses across multiple characters",
             "Fit mesh template and bake normal maps",
-            "Export glTF / GLB and animation data",
+            "Interpolate frames, import BVH, add procedural motions",
+            "Pipeline A: Sprite/FRM export  |  Pipeline B: GLB/3D export",
         ]
         if 0 <= idx < len(labels):
             self.statusBar().showMessage(labels[idx])

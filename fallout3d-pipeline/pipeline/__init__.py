@@ -4,3 +4,6 @@ from .pose_library import PoseLibrary
 from .mesh_fitter import MeshFitter
 from .normal_map_baker import NormalMapBaker
 from .gltf_exporter import GLTFExporter
+from .skin_projector import SkinProjector
+from .animation_synthesizer import AnimationSynthesizer
+from .frm_writer import FRMWriter
