@@ -1,18 +1,31 @@
 """
 Tab 1 — Asset Loader
 Loads .npy / .png / .frm sprite sheets, shows thumbnail grids,
-and manages the character list.
+and manages the character list.  FRM files are decoded using the
+verified pal.py + frmpixels.py pipeline from example_scripts/.
 """
 
+import sys
 import os
-import struct
 import numpy as np
+
+# ── example_scripts bootstrap ───────────────────────────────────────────
+_GUI_DIR    = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT  = os.path.dirname(os.path.dirname(_GUI_DIR))   # gui/ → pipeline/ → repo
+_SCRIPTS    = os.path.join(_REPO_ROOT, "example_scripts")
+_PAL_PATH   = os.path.join(_REPO_ROOT, "color", "color.pal")
+
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+
+import pal as _pal_mod
+import frmpixels as _frmpixels
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QListWidget, QListWidgetItem, QFileDialog,
     QScrollArea, QGridLayout, QGroupBox, QSizePolicy, QFrame,
-    QProgressBar, QLineEdit,
+    QProgressBar, QLineEdit, QSpinBox, QSlider,
 )
 from PyQt6.QtGui import QPixmap, QImage, QColor
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
@@ -21,63 +34,33 @@ from gui.main_window import AppState, CharacterData, CRITTER_CATEGORIES
 
 
 # -----------------------------------------------------------------------
-# FRM reader
+# Palette / pixel helpers
 # -----------------------------------------------------------------------
 
-def _read_pal(path: str):
-    """Read a Fallout .pal file — 256 × 3 bytes, values in [0, 63] → scale ×4."""
-    with open(path, "rb") as f:
-        raw = f.read(768)
-    return [(raw[i * 3] * 4, raw[i * 3 + 1] * 4, raw[i * 3 + 2] * 4) for i in range(256)]
+def _load_palette(pal_path: str) -> np.ndarray:
+    """Return (256, 3) uint8 RGB table via the verified pal.readPAL()."""
+    with open(pal_path, "rb") as f:
+        tuples = _pal_mod.readPAL(f)
+    return np.array([(r, g, b) for r, g, b in tuples], dtype=np.uint8)
 
 
-def _read_frm(frm_path: str, palette) -> np.ndarray:
-    """
-    Parse a Fallout 2 .FRM file.
-    Returns ndarray of shape (6, N, H, W, 3) uint8.
-    """
-    with open(frm_path, "rb") as f:
-        data = f.read()
+def _indices_to_rgba(indices: np.ndarray, pal_table: np.ndarray) -> np.ndarray:
+    """(H, W) palette-index array → (H, W, 4) RGBA; index 0 is transparent."""
+    rgba = np.zeros((*indices.shape, 4), dtype=np.uint8)
+    rgba[..., :3] = pal_table[indices]
+    rgba[..., 3]  = np.where(indices == 0, 0, 255).astype(np.uint8)
+    return rgba
 
-    offset = 0
-    version         = struct.unpack_from(">I", data, offset)[0]; offset += 4
-    fps             = struct.unpack_from(">H", data, offset)[0]; offset += 2
-    action_frame    = struct.unpack_from(">H", data, offset)[0]; offset += 2
-    frames_per_dir  = struct.unpack_from(">H", data, offset)[0]; offset += 2
-    shift_x = struct.unpack_from(">6h", data, offset); offset += 12
-    shift_y = struct.unpack_from(">6h", data, offset); offset += 12
-    dir_offsets = struct.unpack_from(">6I", data, offset); offset += 24
-    data_size = struct.unpack_from(">I", data, offset)[0]; offset += 4
 
-    base = offset  # start of frame data
-    dirs = []
-    for d in range(6):
-        pos = base + dir_offsets[d]
-        frames = []
-        for _ in range(frames_per_dir):
-            w, h = struct.unpack_from(">HH", data, pos); pos += 4
-            pixel_size = struct.unpack_from(">I", data, pos)[0]; pos += 4
-            ox, oy = struct.unpack_from(">hh", data, pos); pos += 4
-            pixels = np.frombuffer(data, dtype=np.uint8, count=w * h, offset=pos)
-            pos += w * h
-            # Palette lookup → RGB
-            rgb = np.array([palette[p] for p in pixels], dtype=np.uint8).reshape(h, w, 3)
-            frames.append(rgb)
-        dirs.append(frames)
-
-    # Pad to uniform size
-    max_h = max(f.shape[0] for d in dirs for f in d)
-    max_w = max(f.shape[1] for d in dirs for f in d)
-    result = np.zeros((6, frames_per_dir, max_h, max_w, 3), dtype=np.uint8)
-    for d, frames in enumerate(dirs):
-        for fi, frame in enumerate(frames):
-            h, w = frame.shape[:2]
-            result[d, fi, :h, :w] = frame
-    return result
+def _to_pixmap(rgba: np.ndarray) -> QPixmap:
+    h, w = rgba.shape[:2]
+    data = rgba.tobytes()
+    qimg = QImage(data, w, h, w * 4, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(qimg)
 
 
 # -----------------------------------------------------------------------
-# Worker thread for background loading
+# Worker thread for background loading (CharacterData pipeline)
 # -----------------------------------------------------------------------
 
 class LoadWorker(QObject):
@@ -87,8 +70,8 @@ class LoadWorker(QObject):
 
     def __init__(self, path: str, name: str, category: str, pal_path: str = ""):
         super().__init__()
-        self.path = path
-        self.name = name
+        self.path     = path
+        self.name     = name
         self.category = category
         self.pal_path = pal_path
 
@@ -99,7 +82,6 @@ class LoadWorker(QObject):
 
             if ext == ".npy":
                 arr = np.load(self.path)
-                # Expected: (6, N, H, W, 3) or (6, N, H, W)
                 if arr.ndim == 4:
                     arr = np.stack([arr] * 3, axis=-1)
                 frames = arr.astype(np.uint8)
@@ -109,18 +91,32 @@ class LoadWorker(QObject):
                 img = cv2.imread(self.path)
                 if img is None:
                     raise IOError(f"Cannot read image: {self.path}")
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                # Treat single image as 1 direction × 1 frame
-                frames = img[np.newaxis, np.newaxis]   # (1, 1, H, W, 3)
-                # Tile to 6 directions
-                frames = np.tile(frames, (6, 1, 1, 1, 1))
+                img    = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                frames = np.tile(img[np.newaxis, np.newaxis], (6, 1, 1, 1, 1))
 
             elif ext == ".frm":
-                if self.pal_path and os.path.exists(self.pal_path):
-                    pal = _read_pal(self.pal_path)
-                else:
-                    pal = [(i, i, i) for i in range(256)]  # greyscale fallback
-                frames = _read_frm(self.path, pal)
+                pal_path  = (self.pal_path if self.pal_path and os.path.exists(self.pal_path)
+                             else _PAL_PATH)
+                pal_table = _load_palette(pal_path)           # (256, 3) uint8
+
+                with open(self.path, "rb") as f:
+                    info = _frmpixels.readFRMInfo(f, exportImage=True)
+
+                n_dirs   = info['numDirections']
+                n_frames = info['numFrames']
+                offsets  = info['frameOffsets']   # [dir][frame] → {'w','h',...}
+                pixels   = info['framePixels']    # [dir][frame] → 1-D np.uint8
+
+                max_w = max(fo['w'] for d in offsets for fo in d)
+                max_h = max(fo['h'] for d in offsets for fo in d)
+
+                frames = np.zeros((6, n_frames, max_h, max_w, 3), dtype=np.uint8)
+                for d in range(n_dirs):
+                    for fi in range(n_frames):
+                        fo = offsets[d][fi]
+                        w, h = fo['w'], fo['h']
+                        idx  = pixels[d][fi].reshape(h, w)
+                        frames[d, fi, :h, :w] = pal_table[idx]
 
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
@@ -128,11 +124,7 @@ class LoadWorker(QObject):
             if frames.dtype != np.uint8:
                 frames = np.clip(frames, 0, 255).astype(np.uint8)
 
-            char = CharacterData(
-                name=self.name,
-                category=self.category,
-                frames=frames,
-            )
+            char = CharacterData(name=self.name, category=self.category, frames=frames)
             self.finished.emit(char)
 
         except Exception as exc:
@@ -140,11 +132,11 @@ class LoadWorker(QObject):
 
 
 # -----------------------------------------------------------------------
-# Thumbnail widget
+# Thumbnail widget (CharacterData sprite preview)
 # -----------------------------------------------------------------------
 
 class ThumbnailGrid(QScrollArea):
-    """Displays one row per direction, one thumbnail per frame."""
+    """One row per direction, one thumbnail per frame."""
 
     THUMB_SIZE = 64
 
@@ -159,7 +151,6 @@ class ThumbnailGrid(QScrollArea):
 
     def set_frames(self, frames: np.ndarray):
         """frames: (6, N, H, W, 3)"""
-        # Clear
         while self._grid.count():
             item = self._grid.takeAt(0)
             if item.widget():
@@ -167,25 +158,185 @@ class ThumbnailGrid(QScrollArea):
 
         n_dirs, n_frames = frames.shape[0], frames.shape[1]
         for d in range(n_dirs):
-            dir_label = QLabel(f"Dir {d+1}")
-            dir_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self._grid.addWidget(dir_label, d, 0)
+            lbl = QLabel(f"Dir {d+1}")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._grid.addWidget(lbl, d, 0)
 
-            for f in range(min(n_frames, 30)):   # cap at 30 thumbnails per row
+            for f in range(min(n_frames, 30)):
                 img = frames[d, f]
                 if img.dtype != np.uint8:
                     img = img.astype(np.uint8)
                 h, w, c = img.shape
                 qimg = QImage(img.data, w, h, w * c, QImage.Format.Format_RGB888)
-                pix = QPixmap.fromImage(qimg).scaled(
+                pix  = QPixmap.fromImage(qimg).scaled(
                     self.THUMB_SIZE, self.THUMB_SIZE,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                lbl = QLabel()
-                lbl.setPixmap(pix)
-                lbl.setToolTip(f"Dir {d+1}, Frame {f+1}")
-                self._grid.addWidget(lbl, d, f + 1)
+                cell = QLabel()
+                cell.setPixmap(pix)
+                cell.setToolTip(f"Dir {d+1}, Frame {f+1}")
+                self._grid.addWidget(cell, d, f + 1)
+
+
+# -----------------------------------------------------------------------
+# FRM Viewer
+# -----------------------------------------------------------------------
+
+class _DirectionRow(QWidget):
+    """One direction row: frame display + spinbox/slider scrubber."""
+
+    DISPLAY_SIZE = 160      # max px for frame thumbnail
+
+    def __init__(self, dir_idx, frame_pixels, frame_offsets, pal_table, parent=None):
+        super().__init__(parent)
+        self._pixels  = frame_pixels   # list[np.ndarray]  (1-D indexed)
+        self._offsets = frame_offsets  # list[dict]  with 'w' / 'h'
+        self._pal     = pal_table      # (256, 3) uint8
+        self._n       = len(frame_pixels)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+
+        dir_lbl = QLabel(f"Dir {dir_idx + 1}")
+        dir_lbl.setFixedWidth(44)
+        lay.addWidget(dir_lbl)
+
+        self._img = QLabel()
+        self._img.setFixedSize(self.DISPLAY_SIZE, self.DISPLAY_SIZE)
+        self._img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img.setStyleSheet("background:#111;border:1px solid #444;")
+        lay.addWidget(self._img)
+
+        ctrl = QVBoxLayout()
+
+        self._counter = QLabel(f"1 / {self._n}")
+        self._counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ctrl.addWidget(self._counter)
+
+        scrub = QHBoxLayout()
+        self._spin = QSpinBox()
+        self._spin.setRange(1, self._n)
+        self._spin.setFixedWidth(56)
+        scrub.addWidget(self._spin)
+
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, self._n - 1)
+        scrub.addWidget(self._slider)
+
+        ctrl.addLayout(scrub)
+        lay.addLayout(ctrl)
+
+        self._spin.valueChanged.connect(self._on_spin)
+        self._slider.valueChanged.connect(self._on_slide)
+        self._show(0)
+
+    # --- scrubber wiring (mutual blocking to avoid recursion) ---
+
+    def _on_spin(self, v):
+        self._slider.blockSignals(True)
+        self._slider.setValue(v - 1)
+        self._slider.blockSignals(False)
+        self._show(v - 1)
+
+    def _on_slide(self, v):
+        self._spin.blockSignals(True)
+        self._spin.setValue(v + 1)
+        self._spin.blockSignals(False)
+        self._show(v)
+
+    def _show(self, idx):
+        fo = self._offsets[idx]
+        w, h = fo['w'], fo['h']
+        indices = self._pixels[idx].reshape(h, w)
+        rgba = _indices_to_rgba(indices, self._pal)
+        pix  = _to_pixmap(rgba).scaled(
+            self.DISPLAY_SIZE, self.DISPLAY_SIZE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self._img.setPixmap(pix)
+        self._counter.setText(f"{idx + 1} / {self._n}")
+
+
+class FrmViewerPanel(QGroupBox):
+    """Load FRM → display all directions with per-direction frame scrubbers."""
+
+    def __init__(self, pal_path: str, parent=None):
+        super().__init__("FRM Viewer", parent)
+        self._pal_path  = pal_path
+        self._pal_table = self._init_palette()
+        self._build_ui()
+
+    def _init_palette(self) -> np.ndarray:
+        if os.path.exists(self._pal_path):
+            return _load_palette(self._pal_path)
+        # greyscale fallback so the viewer is usable even without color.pal
+        return np.array([(i, i, i) for i in range(256)], dtype=np.uint8)
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        self._btn_load = QPushButton("Load FRM…")
+        self._btn_load.clicked.connect(self._open)
+        top.addWidget(self._btn_load)
+
+        self._info_lbl = QLabel("No FRM loaded.")
+        self._info_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        top.addWidget(self._info_lbl, 1)
+        lay.addLayout(top)
+
+        # Scrollable area that holds one _DirectionRow per direction
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setMinimumHeight(350)
+        self._rows_container = QWidget()
+        self._rows_layout = QVBoxLayout(self._rows_container)
+        self._rows_layout.setSpacing(4)
+        self._rows_layout.addStretch()          # always last item
+        self._scroll.setWidget(self._rows_container)
+        lay.addWidget(self._scroll)
+
+    def _open(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open FRM File", "",
+            "Fallout FRM (*.frm *.FRM);;All Files (*)",
+        )
+        if path:
+            self._load(path)
+
+    def _load(self, path: str):
+        try:
+            with open(path, "rb") as f:
+                info = _frmpixels.readFRMInfo(f, exportImage=True)
+        except Exception as exc:
+            self._info_lbl.setText(f"Error: {exc}")
+            return
+
+        n_dirs   = info['numDirections']
+        n_frames = info['numFrames']
+        self._info_lbl.setText(
+            f"{os.path.basename(path)}  —  "
+            f"{n_dirs} dir{'s' if n_dirs != 1 else ''} "
+            f"× {n_frames} frame{'s' if n_frames != 1 else ''}"
+        )
+
+        # Remove old direction rows (everything except the trailing stretch)
+        while self._rows_layout.count() > 1:
+            item = self._rows_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for d in range(n_dirs):
+            row = _DirectionRow(
+                d,
+                info['framePixels'][d],
+                info['frameOffsets'][d],
+                self._pal_table,
+                self._rows_container,
+            )
+            self._rows_layout.insertWidget(d, row)
 
 
 # -----------------------------------------------------------------------
@@ -199,16 +350,13 @@ class AssetLoaderTab(QWidget):
         self._thread: QThread | None = None
         self._build_ui()
 
-    # ------------------------------------------------------------------
-
     def _build_ui(self):
         root = QHBoxLayout(self)
 
-        # ---- Left panel: controls + character list -------------------
+        # ── Left panel: controls + character list ────────────────────────
         left = QVBoxLayout()
         root.addLayout(left, 1)
 
-        # Load controls
         load_box = QGroupBox("Load Asset")
         load_layout = QVBoxLayout(load_box)
 
@@ -220,13 +368,11 @@ class AssetLoaderTab(QWidget):
         self.btn_browse = QPushButton("Browse…")
         self.btn_browse.clicked.connect(self.open_file_dialog)
         btn_row.addWidget(self.btn_browse)
-
         self.btn_browse_dir = QPushButton("Browse Folder…")
         self.btn_browse_dir.clicked.connect(self.open_dir_dialog)
         btn_row.addWidget(self.btn_browse_dir)
         load_layout.addLayout(btn_row)
 
-        # Name + category
         meta_row = QHBoxLayout()
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Character name…")
@@ -242,7 +388,6 @@ class AssetLoaderTab(QWidget):
         cat_row.addWidget(self.cat_combo)
         load_layout.addLayout(cat_row)
 
-        # PAL path (for FRM)
         self.pal_edit = QLineEdit()
         self.pal_edit.setPlaceholderText("Optional: color.pal path for .frm files")
         load_layout.addWidget(self.pal_edit)
@@ -262,45 +407,39 @@ class AssetLoaderTab(QWidget):
 
         left.addWidget(load_box)
 
-        # Character list
         char_box = QGroupBox("Loaded Characters")
         char_layout = QVBoxLayout(char_box)
-
         self.char_list = QListWidget()
         self.char_list.currentRowChanged.connect(self._on_char_selected)
         char_layout.addWidget(self.char_list)
-
         char_btn_row = QHBoxLayout()
         self.btn_remove = QPushButton("Remove")
         self.btn_remove.clicked.connect(self._remove_character)
         char_btn_row.addWidget(self.btn_remove)
         char_layout.addLayout(char_btn_row)
-
         left.addWidget(char_box)
 
-        # ---- Right panel: thumbnail grid ----------------------------
+        # ── Right panel: sprite preview + FRM viewer ─────────────────────
         right = QVBoxLayout()
         root.addLayout(right, 3)
 
         info_box = QGroupBox("Sprite Preview")
         info_layout = QVBoxLayout(info_box)
-
         self.info_lbl = QLabel("No character loaded.")
         info_layout.addWidget(self.info_lbl)
-
         self.thumbnail_grid = ThumbnailGrid()
         info_layout.addWidget(self.thumbnail_grid)
+        right.addWidget(info_box, 1)
 
-        right.addWidget(info_box)
+        self.frm_viewer = FrmViewerPanel(_PAL_PATH)
+        right.addWidget(self.frm_viewer, 2)
 
-        # Connect state signals
+        # Signals
         self.state.character_added.connect(self._refresh_char_list)
         self.state.character_removed.connect(self._refresh_char_list)
         self.state.selection_changed.connect(self._show_character)
 
-    # ------------------------------------------------------------------
-    # File dialogs
-    # ------------------------------------------------------------------
+    # ── File dialogs ──────────────────────────────────────────────────────
 
     def open_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -317,9 +456,7 @@ class AssetLoaderTab(QWidget):
         if directory:
             self._load_directory(directory)
 
-    # ------------------------------------------------------------------
-    # Loading
-    # ------------------------------------------------------------------
+    # ── Loading ───────────────────────────────────────────────────────────
 
     def _load_character(self):
         path = self.path_edit.text().strip()
@@ -327,7 +464,7 @@ class AssetLoaderTab(QWidget):
             self.status_lbl.setText("Please select a valid file.")
             return
 
-        name = self.name_edit.text().strip() or os.path.splitext(os.path.basename(path))[0]
+        name     = self.name_edit.text().strip() or os.path.splitext(os.path.basename(path))[0]
         category = self.cat_combo.currentData()
         pal_path = self.pal_edit.text().strip()
 
@@ -363,7 +500,6 @@ class AssetLoaderTab(QWidget):
         self.status_lbl.setText(f"Error: {msg}")
 
     def _load_directory(self, directory: str):
-        """Load all .npy / .frm files from a directory as one character each."""
         for fname in sorted(os.listdir(directory)):
             ext = os.path.splitext(fname)[1].lower()
             if ext in (".npy", ".frm", ".png"):
@@ -371,9 +507,7 @@ class AssetLoaderTab(QWidget):
                 self.name_edit.setText(os.path.splitext(fname)[0])
                 self._load_character()
 
-    # ------------------------------------------------------------------
-    # Character list management
-    # ------------------------------------------------------------------
+    # ── Character list ────────────────────────────────────────────────────
 
     def _refresh_char_list(self, _=None):
         self.char_list.clear()
