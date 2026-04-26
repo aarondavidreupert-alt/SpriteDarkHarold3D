@@ -9,13 +9,41 @@ REM -----------------------------------------------------------------------
 
 setlocal EnableDelayedExpansion
 
-echo [1/5] Checking Python...
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Python not found. Install Python 3.9+ from https://python.org
-    pause & exit /b 1
+echo [1/5] Locating Python...
+
+REM Try: py launcher (Python Launcher for Windows, lives in System32)
+set "PYTHON="
+py --version >nul 2>&1
+if not errorlevel 1 (
+    set "PYTHON=py"
+    goto :found_python
 )
-python -c "import sys; assert sys.version_info >= (3,9), 'Python 3.9+ required'" 2>nul
+
+REM Try: python in PATH (set by installer with "Add to PATH" checked)
+python --version >nul 2>&1
+if not errorlevel 1 (
+    set "PYTHON=python"
+    goto :found_python
+)
+
+REM Try: python3 in PATH (some installs)
+python3 --version >nul 2>&1
+if not errorlevel 1 (
+    set "PYTHON=python3"
+    goto :found_python
+)
+
+echo ERROR: Python not found via py, python, or python3.
+echo        Install Python 3.9+ from https://www.python.org/downloads/
+echo        Make sure to tick "Add Python to PATH" during install,
+echo        or use the Python Launcher (py.exe) which installs to System32.
+pause & exit /b 1
+
+:found_python
+echo   Found Python: %PYTHON%
+%PYTHON% --version
+
+%PYTHON% -c "import sys; assert sys.version_info >= (3,9), 'old'" 2>nul
 if errorlevel 1 (
     echo ERROR: Python 3.9 or newer is required.
     pause & exit /b 1
@@ -26,7 +54,7 @@ if exist venv (
     echo   venv already exists, removing old one...
     rmdir /s /q venv
 )
-python -m venv venv
+%PYTHON% -m venv venv
 if errorlevel 1 (
     echo ERROR: Could not create venv.
     pause & exit /b 1
