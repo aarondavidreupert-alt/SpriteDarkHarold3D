@@ -14,11 +14,16 @@ FRM binary layout (big-endian):
   Per frame: uint16 w, uint16 h, uint32 pixel_size, int16 ox, int16 oy, w*h bytes
 """
 
+import sys
+import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "example_scripts"))
+import pal as _pal
 
 
 NUM_DIRECTIONS = 6
@@ -57,9 +62,8 @@ class FrmLoader:
     def _read_pal(path: Path) -> list:
         """Return a flat list of 768 ints [R,G,B, R,G,B, ...] scaled to 8-bit."""
         with open(path, "rb") as f:
-            raw = f.read(768)
-        # Fallout .pal stores 6-bit values (0-63); multiply by 4 → 0-252
-        return [b * 4 for b in raw]
+            raw = _pal.readPAL(f)
+        return [val for r, g, b in raw for val in (r, g, b)]
 
     @staticmethod
     def _decode_frm(frm_path: str, palette_flat: list) -> FrameSequence:
