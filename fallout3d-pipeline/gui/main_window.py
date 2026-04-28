@@ -45,6 +45,7 @@ class CharacterData:
     confidences: Optional[np.ndarray] = None    # (N, 33)
     mesh_verts: Optional[np.ndarray] = None     # (V, 3)  rest-pose
     skinning_weights: Optional[np.ndarray] = None
+    upscaled_frames: Optional[np.ndarray] = None    # (6, N, H', W', 3) after upscaling
     color: Tuple[float, float, float] = (1.0, 0.8, 0.2)
 
     @property
@@ -55,11 +56,12 @@ class CharacterData:
 class AppState(QObject):
     """Central data store; tabs connect to its signals for updates."""
 
-    character_added   = pyqtSignal(int)          # index
-    character_removed = pyqtSignal(int)
-    character_updated = pyqtSignal(int)          # data changed (poses, skel…)
-    selection_changed = pyqtSignal(int)          # selected character index
-    frame_changed     = pyqtSignal(int)          # current frame index
+    character_added    = pyqtSignal(int)          # index
+    character_removed  = pyqtSignal(int)
+    character_updated  = pyqtSignal(int)          # data changed (poses, skel…)
+    character_upscaled = pyqtSignal(int)          # upscaled_frames ready
+    selection_changed  = pyqtSignal(int)          # selected character index
+    frame_changed      = pyqtSignal(int)          # current frame index
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -132,6 +134,7 @@ class MainWindow(QMainWindow):
 
     def _build_tabs(self):
         from gui.asset_loader_tab import AssetLoaderTab
+        from gui.upscaler_tab import UpscalerTab
         from gui.pose_editor_tab import PoseEditorTab
         from gui.reconstruction_tab import ReconstructionTab
         from gui.pose_library_tab import PoseLibraryTab
@@ -143,18 +146,20 @@ class MainWindow(QMainWindow):
         self.tabs.setMovable(False)
 
         self.tab_asset       = AssetLoaderTab(self.state, self)
+        self.tab_upscaler    = UpscalerTab(self.state, self)
         self.tab_pose        = PoseEditorTab(self.state, self)
         self.tab_recon       = ReconstructionTab(self.state, self)
         self.tab_library     = PoseLibraryTab(self.state, self)
         self.tab_mesh        = MeshTab(self.state, self)
         self.tab_export      = ExportTab(self.state, self)
 
-        self.tabs.addTab(self.tab_asset,   "1 · Asset Loader")
-        self.tabs.addTab(self.tab_pose,    "2 · Pose Editor")
-        self.tabs.addTab(self.tab_recon,   "3 · 3D Reconstruction")
-        self.tabs.addTab(self.tab_library, "4 · Pose Library")
-        self.tabs.addTab(self.tab_mesh,    "5 · Mesh & Normals")
-        self.tabs.addTab(self.tab_export,  "6 · Export")
+        self.tabs.addTab(self.tab_asset,    "1 · Asset Loader")
+        self.tabs.addTab(self.tab_upscaler, "2 · Upscaler")
+        self.tabs.addTab(self.tab_pose,     "3 · Pose Editor")
+        self.tabs.addTab(self.tab_recon,    "4 · 3D Reconstruction")
+        self.tabs.addTab(self.tab_library,  "5 · Pose Library")
+        self.tabs.addTab(self.tab_mesh,     "6 · Mesh & Normals")
+        self.tabs.addTab(self.tab_export,   "7 · Export")
 
         self.setCentralWidget(self.tabs)
 
@@ -177,7 +182,7 @@ class MainWindow(QMainWindow):
         act_run = QAction("Run Detection", self)
         act_run.setShortcut("Ctrl+R")
         act_run.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(1),
+            self.tabs.setCurrentIndex(2),
             self.tab_pose.run_detection(),
         ))
         tb.addAction(act_run)
@@ -185,7 +190,7 @@ class MainWindow(QMainWindow):
         act_tri = QAction("Triangulate", self)
         act_tri.setShortcut("Ctrl+T")
         act_tri.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(2),
+            self.tabs.setCurrentIndex(3),
             self.tab_recon.run_triangulation(),
         ))
         tb.addAction(act_tri)
@@ -193,7 +198,7 @@ class MainWindow(QMainWindow):
         act_exp = QAction("Export GLB…", self)
         act_exp.setShortcut("Ctrl+E")
         act_exp.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(5),
+            self.tabs.setCurrentIndex(6),
             self.tab_export.export_glb(),
         ))
         tb.addAction(act_exp)
@@ -201,6 +206,7 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, idx: int):
         labels = [
             "Load critter sprites (.npy / .png / .frm)",
+            "Upscale frames with Real-ESRGAN",
             "Inspect and correct 2D pose landmarks",
             "Run 3D triangulation and inspect skeleton",
             "Average poses across multiple characters",
