@@ -3,6 +3,7 @@ PoseTriangulator — MediaPipe pose detection across 6 isometric views,
 with flip correction, per-landmark confidence weighting, and triangulation.
 """
 
+import os
 import math
 import numpy as np
 import cv2
@@ -15,6 +16,21 @@ try:
     _MP_AVAILABLE = True
 except ImportError:
     _MP_AVAILABLE = False
+
+# -----------------------------------------------------------------------
+# Model paths (Tasks API)
+# -----------------------------------------------------------------------
+
+_PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT    = os.path.dirname(os.path.dirname(_PIPELINE_DIR))
+_MODEL_DIR    = os.path.join(_REPO_ROOT, "models")
+_MODEL_PATH   = os.path.join(_MODEL_DIR, "pose_landmarker_heavy.task")
+_MODEL_URL    = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "pose_landmarker/pose_landmarker_heavy/float16/latest/"
+    "pose_landmarker_heavy.task"
+)
+
 
 # -----------------------------------------------------------------------
 # Skeleton connectivity
@@ -82,13 +98,24 @@ class PoseTriangulator:
         if self._pose_detector is None:
             if not _MP_AVAILABLE:
                 raise RuntimeError("mediapipe is not installed.")
-            mp_pose = mp.solutions.pose
-            self._pose_detector = mp_pose.Pose(
-                static_image_mode=False,
-                model_complexity=2,
-                min_detection_confidence=0.5,
+
+            if not os.path.exists(_MODEL_PATH):
+                import urllib.request
+                os.makedirs(_MODEL_DIR, exist_ok=True)
+                urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+
+            from mediapipe.tasks import python as _mptasks
+            from mediapipe.tasks.python import vision as _mpvision
+
+            options = _mpvision.PoseLandmarkerOptions(
+                base_options=_mptasks.BaseOptions(model_asset_path=_MODEL_PATH),
+                running_mode=_mpvision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
+            self._pose_detector = _mpvision.PoseLandmarker.create_from_options(options)
         return self._pose_detector
 
     # ------------------------------------------------------------------
@@ -154,12 +181,16 @@ class PoseTriangulator:
                 elif img.shape[2] == 4:
                     img = img[:, :, :3]
 
-                results = detector.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                mp_image = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=np.ascontiguousarray(img),
+                )
+                result = detector.detect(mp_image)
 
-                if results.pose_landmarks:
+                if result.pose_landmarks:
                     lms = np.array([
                         [*_normalized_to_pixel(lm.x, lm.y, w, h), lm.z]
-                        for lm in results.pose_landmarks.landmark
+                        for lm in result.pose_landmarks[0]
                     ], dtype=float)
                     lms = self._correct_flip(lms, persp_idx)
                 else:
