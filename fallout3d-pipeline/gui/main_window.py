@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QTabWidget, QStatusBar, QToolBar, QApplication,
+    QMainWindow, QTabWidget, QStatusBar, QToolBar, QApplication, QSplitter,
 )
 from PyQt6.QtGui import QAction
 from PyQt6.QtCore import Qt, pyqtSignal, QObject
@@ -46,6 +46,7 @@ class CharacterData:
     mesh_verts: Optional[np.ndarray] = None     # (V, 3)  rest-pose
     skinning_weights: Optional[np.ndarray] = None
     upscaled_frames: Optional[np.ndarray] = None    # (6, N, H', W', 3) after upscaling
+    annotated_frames: Optional[np.ndarray] = None   # (6, N, H, W, 3) with MP overlay
     color: Tuple[float, float, float] = (1.0, 0.8, 0.2)
 
     @property
@@ -126,6 +127,7 @@ class MainWindow(QMainWindow):
         self.state = AppState(self)
 
         self._build_tabs()
+        self._build_console()
         self._build_toolbar()
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready — load a critter asset to begin.")
@@ -161,10 +163,28 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_mesh,     "6 · Mesh & Normals")
         self.tabs.addTab(self.tab_export,   "7 · Export")
 
-        self.setCentralWidget(self.tabs)
+        # Central widget is set in _build_console() via a QSplitter
 
         # Forward tab changes so status bar stays informative
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _build_console(self):
+        import logging
+        from gui.console_widget import ConsoleWidget
+
+        self._console = ConsoleWidget(self)
+
+        splitter = QSplitter(Qt.Orientation.Vertical, self)
+        splitter.addWidget(self.tabs)
+        splitter.addWidget(self._console)
+        splitter.setSizes([720, 160])
+        splitter.setCollapsible(1, True)
+        self.setCentralWidget(splitter)
+
+        root = logging.getLogger()
+        root.addHandler(self._console.handler)
+        if root.level == logging.NOTSET or root.level > logging.DEBUG:
+            root.setLevel(logging.DEBUG)
 
     def _build_toolbar(self):
         tb = QToolBar("Main")

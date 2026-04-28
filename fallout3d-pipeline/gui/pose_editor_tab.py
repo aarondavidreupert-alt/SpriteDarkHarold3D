@@ -4,8 +4,12 @@ Runs MediaPipe detection in background, then displays all 6 views with
 draggable landmarks overlaid in a confidence heatmap.
 """
 
+import logging as _logging_mod
+
 import numpy as np
 import cv2
+
+_logger = _logging_mod.getLogger(__name__)
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -197,29 +201,124 @@ class ViewCanvas(QGraphicsView):
 # -----------------------------------------------------------------------
 
 class DetectionWorker(QObject):
+    """
+    Runs MediaPipe Holistic (or Pose as fallback) on every view×frame,
+    draws landmarks onto annotated frames, and stores results in CharacterData.
+    """
     progress = pyqtSignal(int, int)
     finished = pyqtSignal()
     error    = pyqtSignal(str)
 
-    def __init__(self, triangulator, char):
+    def __init__(self, char):
         super().__init__()
-        self.triangulator = triangulator
         self.char = char
 
     def run(self):
         try:
-            self.triangulator.load_animation_sequence(self.char.frames)
-            self.triangulator.detect_poses_sequence(
-                progress_cb=lambda f, t: self.progress.emit(f, t)
+            import mediapipe as mp
+        except ImportError:
+            msg = "mediapipe not installed — run: pip install mediapipe"
+            _logger.error(msg)
+            self.error.emit(msg)
+            return
+
+        try:
+            frames = (
+                self.char.upscaled_frames
+                if self.char.upscaled_frames is not None
+                else self.char.frames
             )
-            self.char.poses_2d = self.triangulator.poses_sequence
-            # Build simple confidence map from z
-            if self.char.poses_2d is not None:
-                z = np.abs(self.char.poses_2d[:, :, :, 2])
-                z_max = z.max() + 1e-6
-                self.char.confidences = (z / z_max).mean(axis=1)  # (N, 33)
+            n_dirs   = int(frames.shape[0])
+            n_frames = int(frames.shape[1])
+            h        = int(frames.shape[2])
+            w        = int(frames.shape[3])
+
+            poses_out = np.zeros((n_frames, n_dirs, 33, 3))
+            annotated = np.zeros((n_dirs, n_frames, h, w, 3), dtype=np.uint8)
+
+            # Try Holistic first (face + body + hands); fall back to Pose only
+            try:
+                detector_ctx = mp.solutions.holistic.Holistic(
+                    static_image_mode=True, min_detection_confidence=0.5
+                )
+                mode = "holistic"
+            except AttributeError:
+                detector_ctx = mp.solutions.pose.Pose(
+                    static_image_mode=True, min_detection_confidence=0.5
+                )
+                mode = "pose"
+
+            _logger.info(
+                "Starting detection — %d views × %d frames (%d×%d px) "
+                "using MediaPipe %s",
+                n_dirs, n_frames, w, h, mode,
+            )
+
+            drawing       = mp.solutions.drawing_utils
+            pose_cx       = mp.solutions.pose.POSE_CONNECTIONS
+            lm_spec       = drawing.DrawingSpec(color=(0, 180, 0),   thickness=1, circle_radius=2)
+            conn_spec     = drawing.DrawingSpec(color=(200, 200, 200), thickness=1)
+
+            with detector_ctx as detector:
+                for frame_idx in range(n_frames):
+                    n_detected = 0
+                    for dir_idx in range(n_dirs):
+                        img_rgb = frames[dir_idx, frame_idx]
+                        if img_rgb.dtype != np.uint8:
+                            img_rgb = (
+                                (np.clip(img_rgb, 0, 1) * 255).astype(np.uint8)
+                                if img_rgb.max() <= 1.0
+                                else img_rgb.astype(np.uint8)
+                            )
+
+                        result   = detector.process(img_rgb)
+                        pose_lms = result.pose_landmarks
+
+                        # draw_landmarks expects BGR; convert, draw, convert back
+                        img_bgr = img_rgb[..., ::-1].copy()
+                        if pose_lms is not None:
+                            drawing.draw_landmarks(
+                                img_bgr, pose_lms, pose_cx, lm_spec, conn_spec
+                            )
+                            for lm_idx, lm in enumerate(pose_lms.landmark):
+                                px = max(0, min(int(lm.x * w), w - 1))
+                                py = max(0, min(int(lm.y * h), h - 1))
+                                poses_out[frame_idx, dir_idx, lm_idx] = [
+                                    px, py, lm.visibility
+                                ]
+                                _logger.debug(
+                                    "F%d D%d LM%02d: (%d,%d) vis=%.2f",
+                                    frame_idx, dir_idx, lm_idx, px, py, lm.visibility,
+                                )
+                            n_detected += 1
+                        else:
+                            _logger.warning(
+                                "No pose detected — frame=%d dir=%d",
+                                frame_idx, dir_idx,
+                            )
+
+                        annotated[dir_idx, frame_idx] = img_bgr[..., ::-1]
+
+                    _logger.info(
+                        "Frame %d/%d — pose in %d/%d views",
+                        frame_idx + 1, n_frames, n_detected, n_dirs,
+                    )
+                    self.progress.emit(frame_idx + 1, n_frames)
+
+            self.char.poses_2d        = poses_out
+            self.char.annotated_frames = annotated
+
+            z     = np.abs(poses_out[:, :, :, 2])
+            z_max = z.max() + 1e-6
+            self.char.confidences = (z / z_max).mean(axis=1)  # (N, 33)
+
+            _logger.info("Pose detection complete.")
             self.finished.emit()
+
         except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            _logger.error("Detection failed: %s\n%s", exc, tb)
             self.error.emit(str(exc))
 
 
@@ -232,8 +331,6 @@ class PoseEditorTab(QWidget):
         super().__init__(parent)
         self.state = state
         self._thread: QThread | None = None
-        from pipeline import PoseTriangulator
-        self._triangulator = PoseTriangulator()
         self._build_ui()
 
         self.state.selection_changed.connect(self._on_char_changed)
@@ -336,7 +433,7 @@ class PoseEditorTab(QWidget):
         self.progress.setValue(0)
         self.status_lbl.setText("Running MediaPipe…")
 
-        self._worker = DetectionWorker(self._triangulator, char)
+        self._worker = DetectionWorker(char)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -389,8 +486,17 @@ class PoseEditorTab(QWidget):
         n = char.n_frames
         self.frame_lbl.setText(f"{frame_idx + 1} / {n}")
 
+        ann = char.annotated_frames    # (6, N, H, W, 3) or None
+        usc = char.upscaled_frames     # (6, N, H, W, 3) or None
+
         for v in range(min(6, char.frames.shape[0])):
-            img = char.frames[v, frame_idx]
+            fi = min(frame_idx, char.frames.shape[1] - 1)
+            if ann is not None and v < ann.shape[0] and fi < ann.shape[1]:
+                img = ann[v, fi]
+            elif usc is not None and v < usc.shape[0] and fi < usc.shape[1]:
+                img = usc[v, fi]
+            else:
+                img = char.frames[v, fi]
             pose = None
             if char.poses_2d is not None:
                 pose = char.poses_2d[frame_idx, v]
