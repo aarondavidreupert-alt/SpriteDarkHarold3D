@@ -80,6 +80,8 @@ class LoadWorker(QObject):
             ext = os.path.splitext(self.path)[1].lower()
             self.progress.emit(f"Loading {os.path.basename(self.path)}…")
 
+            frm_offsets = None  # populated only for .frm files
+
             if ext == ".npy":
                 arr = np.load(self.path)
                 if arr.ndim == 4:
@@ -104,19 +106,54 @@ class LoadWorker(QObject):
 
                 n_dirs   = info['numDirections']
                 n_frames = info['numFrames']
-                offsets  = info['frameOffsets']   # [dir][frame] → {'w','h',...}
+                offsets  = info['frameOffsets']   # [dir][frame] → {'x','y','w','h'}
                 pixels   = info['framePixels']    # [dir][frame] → 1-D np.uint8
 
-                max_w = max(fo['w'] for d in offsets for fo in d)
-                max_h = max(fo['h'] for d in offsets for fo in d)
+                # frmpixels 'x'/'y' are per-frame deltas — accumulate to get
+                # absolute position (same logic as exportFRM in frmpixels.py).
+                cum_x = [[0] * n_frames for _ in range(n_dirs)]
+                cum_y = [[0] * n_frames for _ in range(n_dirs)]
+                for d in range(n_dirs):
+                    ox, oy = 0, 0
+                    for fi in range(n_frames):
+                        ox += offsets[d][fi]['x']
+                        oy += offsets[d][fi]['y']
+                        cum_x[d][fi] = ox
+                        cum_y[d][fi] = oy
 
-                frames = np.zeros((6, n_frames, max_h, max_w, 3), dtype=np.uint8)
+                # Shift so the minimum offset lands at (0, 0)
+                min_x = min(cum_x[d][fi] for d in range(n_dirs) for fi in range(n_frames))
+                min_y = min(cum_y[d][fi] for d in range(n_dirs) for fi in range(n_frames))
+                abs_x = [[cum_x[d][fi] - min_x for fi in range(n_frames)] for d in range(n_dirs)]
+                abs_y = [[cum_y[d][fi] - min_y for fi in range(n_frames)] for d in range(n_dirs)]
+
+                # Canvas large enough to hold every frame at its registered position
+                canvas_w = max(
+                    abs_x[d][fi] + offsets[d][fi]['w']
+                    for d in range(n_dirs) for fi in range(n_frames)
+                )
+                canvas_h = max(
+                    abs_y[d][fi] + offsets[d][fi]['h']
+                    for d in range(n_dirs) for fi in range(n_frames)
+                )
+                self.progress.emit(
+                    f"FRM canvas {canvas_w}×{canvas_h} px "
+                    f"({n_dirs} dirs × {n_frames} frames)…"
+                )
+
+                frames = np.zeros((6, n_frames, canvas_h, canvas_w, 3), dtype=np.uint8)
                 for d in range(n_dirs):
                     for fi in range(n_frames):
-                        fo = offsets[d][fi]
-                        w, h = fo['w'], fo['h']
-                        idx  = pixels[d][fi].reshape(h, w)
-                        frames[d, fi, :h, :w] = pal_table[idx]
+                        fo   = offsets[d][fi]
+                        fw, fh = fo['w'], fo['h']
+                        ox, oy = abs_x[d][fi], abs_y[d][fi]
+                        idx  = pixels[d][fi].reshape(fh, fw)
+                        frames[d, fi, oy:oy+fh, ox:ox+fw] = pal_table[idx]
+
+                frm_offsets = [
+                    [(abs_x[d][fi], abs_y[d][fi]) for fi in range(n_frames)]
+                    for d in range(n_dirs)
+                ]
 
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
@@ -125,8 +162,9 @@ class LoadWorker(QObject):
                 frames = np.clip(frames, 0, 255).astype(np.uint8)
 
             char = CharacterData(
-                name=self.name, category=self.category, frames=frames,
-                source_path=self.path,
+                name=self.name, category=self.category,
+                frames=frames, source_path=self.path,
+                frm_offsets=frm_offsets,
             )
             self.finished.emit(char)
 
