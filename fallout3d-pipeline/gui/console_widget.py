@@ -83,6 +83,10 @@ class ConsoleWidget(QWidget):
 
         self._te = QTextEdit()
         self._te.setReadOnly(True)
+        self._te.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse |
+            Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
         mono = QFont("Courier New", 9)
         mono.setStyleHint(QFont.StyleHint.Monospace)
         self._te.setFont(mono)
