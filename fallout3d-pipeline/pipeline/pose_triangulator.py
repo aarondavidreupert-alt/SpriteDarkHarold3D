@@ -60,6 +60,35 @@ PART_COLORS = {
 _FLIP_PAIRS = [(11, 12), (13, 14), (15, 16), (23, 24),
                (7, 8), (9, 10), (1, 4), (2, 5), (3, 6)]
 
+_SQRT2 = math.sqrt(2)
+
+# Expected right_shoulder→left_shoulder direction per isometric view (unit vectors)
+DIR_EXPECTED_SHOULDER = {
+    0: np.array([ 1.0, -1.0]) / _SQRT2,  # NE
+    1: np.array([ 1.0,  0.0]),            # E
+    2: np.array([ 1.0,  1.0]) / _SQRT2,  # SE
+    3: np.array([-1.0,  1.0]) / _SQRT2,  # SW
+    4: np.array([-1.0,  0.0]),            # W
+    5: np.array([-1.0, -1.0]) / _SQRT2,  # NW
+}
+
+_UPPER_FLIP_PAIRS = [(11, 12), (13, 14), (15, 16), (7, 8), (1, 4), (2, 5), (3, 6)]
+_LOWER_FLIP_PAIRS = [(23, 24), (25, 26), (27, 28), (29, 30), (31, 32)]
+
+LANDMARK_SIDE: dict = {}
+for _i in [11, 13, 15, 23, 25, 27, 29, 31, 1, 2, 3, 7, 9]:
+    LANDMARK_SIDE[_i] = "left"
+for _i in [12, 14, 16, 24, 26, 28, 30, 32, 4, 5, 6, 8, 10]:
+    LANDMARK_SIDE[_i] = "right"
+for _i in [0] + list(range(17, 23)):
+    LANDMARK_SIDE[_i] = "center"
+
+_SIDE_DOT_COLORS = {
+    "left":   (0, 100, 255),
+    "right":  (255, 60, 60),
+    "center": (255, 255, 255),
+}
+
 
 def _normalized_to_pixel(nx, ny, w, h):
     px = min(math.floor(nx * w), w - 1)
@@ -132,21 +161,24 @@ class PoseTriangulator:
     # ------------------------------------------------------------------
 
     def _correct_flip(self, pose_2d: np.ndarray, perspective_idx: int) -> np.ndarray:
-        """Swap left/right landmarks if the shoulder direction is mirrored."""
-        angle = perspective_idx * 60
-        expected = np.array([np.cos(np.radians(angle)), np.sin(np.radians(angle))])
-        left_sh, right_sh = pose_2d[11], pose_2d[12]
-
-        if np.all(left_sh == 0) or np.all(right_sh == 0):
-            return pose_2d
-
-        seg = right_sh[:2] - left_sh[:2]
-        if np.dot(seg, expected) >= 0:
-            return pose_2d
-
+        """Independently correct upper-body (shoulder) and lower-body (hip) flips."""
+        expected  = DIR_EXPECTED_SHOULDER[perspective_idx % 6]
         corrected = pose_2d.copy()
-        for l, r in _FLIP_PAIRS:
-            corrected[l], corrected[r] = corrected[r].copy(), corrected[l].copy()
+
+        left_sh, right_sh = corrected[11], corrected[12]
+        if not (np.all(left_sh == 0) or np.all(right_sh == 0)):
+            seg = right_sh[:2] - left_sh[:2]
+            if np.dot(seg, expected) < 0:
+                for l, r in _UPPER_FLIP_PAIRS:
+                    corrected[l], corrected[r] = corrected[r].copy(), corrected[l].copy()
+
+        left_hip, right_hip = corrected[23], corrected[24]
+        if not (np.all(left_hip == 0) or np.all(right_hip == 0)):
+            seg = right_hip[:2] - left_hip[:2]
+            if np.dot(seg, expected) < 0:
+                for l, r in _LOWER_FLIP_PAIRS:
+                    corrected[l], corrected[r] = corrected[r].copy(), corrected[l].copy()
+
         return corrected
 
     # ------------------------------------------------------------------
@@ -282,11 +314,54 @@ class PoseTriangulator:
                          tuple(pose_2d[e, :2].astype(int)), PART_COLORS[part], 2)
         for i, pt in enumerate(pose_2d):
             if not np.all(pt == 0):
-                cv2.circle(img, tuple(pt[:2].astype(int)), 3, (255, 255, 255), -1)
+                dot_color = _SIDE_DOT_COLORS[LANDMARK_SIDE.get(i, "center")]
+                cv2.circle(img, tuple(pt[:2].astype(int)), 3, dot_color, -1)
 
         cv2.putText(img, f"F{frame_idx} V{perspective_idx + 1}", (10, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         return img
+
+    # ------------------------------------------------------------------
+    # Bidirectional detection
+    # ------------------------------------------------------------------
+
+    def detect_poses_bidirectional(self, progress_cb=None):
+        """Run detection forward + backward through frames and merge results.
+
+        Frames where only one pass detects a pose use that result;
+        frames where both passes detect average them for stability.
+        """
+        if self.frames is None:
+            raise ValueError("Load frames with load_animation_sequence() first.")
+        n_frames = self.frames.shape[1]
+
+        def _fwd_cb(f, t):
+            if progress_cb:
+                progress_cb(f, n_frames * 2)
+
+        self.detect_poses_sequence(progress_cb=_fwd_cb)
+        fwd = self.poses_sequence.copy()
+
+        self.frames = self.frames[:, ::-1].copy()
+
+        def _bwd_cb(f, t):
+            if progress_cb:
+                progress_cb(n_frames + f, n_frames * 2)
+
+        self.detect_poses_sequence(progress_cb=_bwd_cb)
+        bwd = self.poses_sequence[::-1].copy()
+        self.frames = self.frames[:, ::-1].copy()  # restore original order
+
+        fwd_zero = np.all(fwd == 0, axis=-1, keepdims=True)
+        bwd_zero = np.all(bwd == 0, axis=-1, keepdims=True)
+        self.poses_sequence = np.where(
+            ~fwd_zero & ~bwd_zero,
+            (fwd + bwd) / 2,
+            np.where(~fwd_zero, fwd, bwd),
+        )
+
+        if progress_cb:
+            progress_cb(n_frames * 2, n_frames * 2)
 
     # ------------------------------------------------------------------
     # Export
