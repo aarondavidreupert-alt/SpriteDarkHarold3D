@@ -124,7 +124,10 @@ class LoadWorker(QObject):
             if frames.dtype != np.uint8:
                 frames = np.clip(frames, 0, 255).astype(np.uint8)
 
-            char = CharacterData(name=self.name, category=self.category, frames=frames)
+            char = CharacterData(
+                name=self.name, category=self.category, frames=frames,
+                source_path=self.path,
+            )
             self.finished.emit(char)
 
         except Exception as exc:

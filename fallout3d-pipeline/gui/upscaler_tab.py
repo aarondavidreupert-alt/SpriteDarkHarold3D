@@ -1,56 +1,42 @@
 """
 Tab 2 — Upscaler
-Applies Real-ESRGAN upscaling to the currently loaded character's frames.
+Supports three backends selectable at runtime:
+  • EDSR (OpenCV DNN)  — fast, deterministic, requires EDSR_x4.pb
+  • Real-ESRGAN        — high-quality neural upscaler
+  • Custom PyTorch     — passthrough for SwinIR / SPAN / HAT / etc.
+
 Upscaled result is stored in CharacterData.upscaled_frames for downstream tabs.
+Cache: <source_dir>/<char_name>_upscaled_<backend>.npy — loaded automatically
+       if present; saved after each successful run.
 """
 
+import os
 import numpy as np
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QComboBox, QGroupBox, QProgressBar, QSpinBox,
+    QComboBox, QGroupBox, QProgressBar, QSpinBox, QLineEdit,
+    QFileDialog, QStackedWidget,
 )
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 
 from gui.main_window import AppState
 
-
-# -----------------------------------------------------------------------
-# Model registry
-# -----------------------------------------------------------------------
-
-MODELS = {
-    "RealESRGAN_x4plus": {
-        "scale": 4,
-        "num_block": 23,
-        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-    },
-    "RealESRGAN_x4plus_anime_6B": {
-        "scale": 4,
-        "num_block": 6,
-        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
-    },
-    "RealESRGAN_x2plus": {
-        "scale": 2,
-        "num_block": 23,
-        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
-    },
-}
-
-DEFAULT_MODEL = "RealESRGAN_x4plus_anime_6B"
+# Pull model registry from the shared module so it stays in one place
+from upscaler import REALESRGAN_MODELS, REALESRGAN_DEFAULT
 
 
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _rgb_to_pixmap(rgb: np.ndarray, max_side: int = 320) -> QPixmap:
-    """RGB (H, W, 3) uint8 → QPixmap, scaled so the longest side ≤ max_side."""
-    h, w = rgb.shape[:2]
-    data = rgb.tobytes()
-    qimg = QImage(data, w, h, w * 3, QImage.Format.Format_RGB888)
-    pix  = QPixmap.fromImage(qimg)
+    """RGB (H, W, 3) uint8 → QPixmap scaled to at most max_side pixels."""
+    h, w  = rgb.shape[:2]
+    data  = rgb.tobytes()
+    qimg  = QImage(data, w, h, w * 3, QImage.Format.Format_RGB888)
+    pix   = QPixmap.fromImage(qimg)
     if max(h, w) > max_side:
         pix = pix.scaled(
             max_side, max_side,
@@ -60,94 +46,85 @@ def _rgb_to_pixmap(rgb: np.ndarray, max_side: int = 320) -> QPixmap:
     return pix
 
 
-# -----------------------------------------------------------------------
+def _cache_path(char, backend: str) -> str:
+    """Derive a .npy cache path next to the source file (or in cwd)."""
+    base_dir = (
+        os.path.dirname(char.source_path)
+        if char.source_path
+        else os.getcwd()
+    )
+    return os.path.join(base_dir, f"{char.name}_upscaled_{backend}.npy")
+
+
+# ---------------------------------------------------------------------------
 # Worker thread
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 class UpscaleWorker(QObject):
     progress = pyqtSignal(int, int, str)   # done, total, message
     finished = pyqtSignal(object)          # np.ndarray (6, N, H', W', 3)
     error    = pyqtSignal(str)
 
-    def __init__(self, frames: np.ndarray, model_name: str):
+    def __init__(
+        self,
+        frames: np.ndarray,
+        backend: str,
+        *,
+        model_path: str = "",
+        model_name: str = REALESRGAN_DEFAULT,
+        cache_path: str = "",
+    ):
         super().__init__()
         self.frames     = frames
+        self.backend    = backend
+        self.model_path = model_path
         self.model_name = model_name
+        self.cache_path = cache_path
 
     def run(self):
-        # Deferred import so a missing package only fails here, not at app start
+        # ── Cache hit ────────────────────────────────────────────────────
+        if self.cache_path and os.path.exists(self.cache_path):
+            try:
+                result = np.load(self.cache_path)
+                self.progress.emit(1, 1, f"Loaded from cache: {os.path.basename(self.cache_path)}")
+                self.finished.emit(result)
+                return
+            except Exception as exc:
+                self.progress.emit(0, 1, f"Cache load failed ({exc}), re-running…")
+
+        # ── Run upscaler ─────────────────────────────────────────────────
         try:
-            from realesrgan import RealESRGANer
-            from basicsr.archs.rrdbnet_arch import RRDBNet
+            from upscaler import upscale_sequence
         except ImportError as exc:
-            self.error.emit(
-                f"Real-ESRGAN not installed.\n"
-                f"Run:  pip install realesrgan\n\nDetail: {exc}"
-            )
+            self.error.emit(f"upscaler module not found: {exc}")
             return
 
         try:
-            cfg   = MODELS[self.model_name]
-            model = RRDBNet(
-                num_in_ch=3, num_out_ch=3, num_feat=64,
-                num_block=cfg["num_block"], num_grow_ch=32, scale=cfg["scale"],
+            result = upscale_sequence(
+                self.frames,
+                self.backend,
+                model_path=self.model_path,
+                model_name=self.model_name,
+                progress_cb=lambda d, t, m: self.progress.emit(d, t, m),
             )
-            upsampler = RealESRGANer(
-                scale=cfg["scale"],
-                model_path=cfg["url"],
-                model=model,
-                tile=0,
-                tile_pad=10,
-                pre_pad=0,
-                half=False,
-            )
-
-            n_dirs, n_frames = self.frames.shape[:2]
-            scale = cfg["scale"]
-            total = n_dirs * n_frames
-            done  = 0
-
-            # Run the first frame to determine actual output dimensions
-            # (RealESRGAN output may differ from h*scale by ±1 in rare cases)
-            first_bgr = self.frames[0, 0][..., ::-1].copy()
-            first_out, _ = upsampler.enhance(first_bgr, outscale=scale)
-            out_h, out_w  = first_out.shape[:2]
-
-            result      = np.zeros((n_dirs, n_frames, out_h, out_w, 3), dtype=np.uint8)
-            result[0, 0] = first_out[..., ::-1]          # BGR → RGB
-            done += 1
-            self.progress.emit(done, total, f"Dir 1/{n_dirs}  Frame 1/{n_frames}")
-
-            for d in range(n_dirs):
-                for fi in range(n_frames):
-                    if d == 0 and fi == 0:
-                        continue
-                    bgr     = self.frames[d, fi][..., ::-1].copy()
-                    out_bgr, _ = upsampler.enhance(bgr, outscale=scale)
-                    out_rgb = out_bgr[..., ::-1]
-                    # Guard: resize if output differs (shouldn't happen for uniform input)
-                    if out_rgb.shape[:2] != (out_h, out_w):
-                        from PIL import Image as _PIL
-                        out_rgb = np.array(
-                            _PIL.fromarray(out_rgb).resize((out_w, out_h), _PIL.LANCZOS)
-                        )
-                    result[d, fi] = out_rgb
-                    done += 1
-                    self.progress.emit(
-                        done, total,
-                        f"Dir {d + 1}/{n_dirs}  Frame {fi + 1}/{n_frames}",
-                    )
-
-            self.finished.emit(result)
-
         except Exception as exc:
             import traceback
             self.error.emit(f"{exc}\n\n{traceback.format_exc()}")
+            return
+
+        # ── Save cache ───────────────────────────────────────────────────
+        if self.cache_path:
+            try:
+                np.save(self.cache_path, result)
+            except Exception:
+                pass  # non-fatal
+
+        self.finished.emit(result)
 
 
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Tab widget
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 class UpscalerTab(QWidget):
     def __init__(self, state: AppState, parent=None):
@@ -163,28 +140,72 @@ class UpscalerTab(QWidget):
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        # ── Controls ─────────────────────────────────────────────────────
-        ctrl_box = QGroupBox("Model & Controls")
+        # ── Controls ──────────────────────────────────────────────────────
+        ctrl_box = QGroupBox("Backend & Controls")
         ctrl_lay = QVBoxLayout(ctrl_box)
 
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Model:"))
+        # Row 1 — backend + model + run
+        row1 = QHBoxLayout()
 
-        self._model_combo = QComboBox()
-        for name in MODELS:
-            self._model_combo.addItem(name, name)
-        self._model_combo.setCurrentText(DEFAULT_MODEL)
-        top.addWidget(self._model_combo)
+        row1.addWidget(QLabel("Backend:"))
+        self._backend_combo = QComboBox()
+        self._backend_combo.addItem("EDSR (OpenCV DNN)",  "edsr")
+        self._backend_combo.addItem("Real-ESRGAN",         "realesrgan")
+        self._backend_combo.addItem("Custom PyTorch",      "torch")
+        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        row1.addWidget(self._backend_combo)
+
+        # Stacked widget: one row per backend's extra options
+        self._opt_stack = QStackedWidget()
+
+        # Page 0 — EDSR: model path + browse button
+        edsr_page = QWidget()
+        edsr_lay  = QHBoxLayout(edsr_page)
+        edsr_lay.setContentsMargins(0, 0, 0, 0)
+        edsr_lay.addWidget(QLabel("Model (.pb):"))
+        self._edsr_path = QLineEdit()
+        self._edsr_path.setPlaceholderText("Path to EDSR_x4.pb …")
+        edsr_lay.addWidget(self._edsr_path, 1)
+        btn_browse = QPushButton("Browse…")
+        btn_browse.setFixedWidth(72)
+        btn_browse.clicked.connect(self._browse_edsr_model)
+        edsr_lay.addWidget(btn_browse)
+        self._opt_stack.addWidget(edsr_page)
+
+        # Page 1 — Real-ESRGAN: model variant picker
+        esrgan_page = QWidget()
+        esrgan_lay  = QHBoxLayout(esrgan_page)
+        esrgan_lay.setContentsMargins(0, 0, 0, 0)
+        esrgan_lay.addWidget(QLabel("Model:"))
+        self._esrgan_combo = QComboBox()
+        for name in REALESRGAN_MODELS:
+            self._esrgan_combo.addItem(name, name)
+        self._esrgan_combo.setCurrentText(REALESRGAN_DEFAULT)
+        esrgan_lay.addWidget(self._esrgan_combo, 1)
+        self._opt_stack.addWidget(esrgan_page)
+
+        # Page 2 — PyTorch: informational label only
+        torch_page = QWidget()
+        torch_lay  = QHBoxLayout(torch_page)
+        torch_lay.setContentsMargins(0, 0, 0, 0)
+        torch_lay.addWidget(QLabel(
+            "Set torch_model in UpscaleWorker before running."
+        ))
+        self._opt_stack.addWidget(torch_page)
+
+        row1.addWidget(self._opt_stack, 2)
 
         self._btn_run = QPushButton("Run Upscaler")
         self._btn_run.setStyleSheet("font-weight: bold; padding: 6px;")
         self._btn_run.clicked.connect(self._run)
-        top.addWidget(self._btn_run)
+        row1.addWidget(self._btn_run)
 
-        top.addStretch()
+        row1.addStretch()
+        ctrl_lay.addLayout(row1)
+
+        # Row 2 — status + progress
         self._status_lbl = QLabel("Load a character in the Asset Loader tab first.")
-        top.addWidget(self._status_lbl)
-        ctrl_lay.addLayout(top)
+        ctrl_lay.addWidget(self._status_lbl)
 
         self._progress = QProgressBar()
         self._progress.setRange(0, 1)
@@ -247,6 +268,19 @@ class UpscalerTab(QWidget):
         prev_lay.addLayout(images)
         root.addWidget(prev_box, 1)
 
+    # ── Backend switching ─────────────────────────────────────────────────
+
+    def _on_backend_changed(self, idx: int):
+        self._opt_stack.setCurrentIndex(idx)
+
+    def _browse_edsr_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select EDSR Model", "",
+            "PB Model (*.pb);;All Files (*)",
+        )
+        if path:
+            self._edsr_path.setText(path)
+
     # ── Upscaling ─────────────────────────────────────────────────────────
 
     def _run(self):
@@ -255,16 +289,24 @@ class UpscalerTab(QWidget):
             self._status_lbl.setText("No character loaded.")
             return
 
-        model_name = self._model_combo.currentData()
+        backend    = self._backend_combo.currentData()
+        model_path = self._edsr_path.text().strip()
+        model_name = self._esrgan_combo.currentData()
+        cache_fp   = _cache_path(char, backend)
         total      = char.frames.shape[0] * char.frames.shape[1]
 
         self._btn_run.setEnabled(False)
         self._progress.setRange(0, total)
         self._progress.setValue(0)
         self._progress.setVisible(True)
-        self._status_lbl.setText("Loading model…")
+        self._status_lbl.setText("Starting…")
 
-        self._worker = UpscaleWorker(char.frames, model_name)
+        self._worker = UpscaleWorker(
+            char.frames, backend,
+            model_path=model_path,
+            model_name=model_name,
+            cache_path=cache_fp,
+        )
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -292,8 +334,7 @@ class UpscalerTab(QWidget):
         self._frame_spin.setRange(1, n_frames)
         self._nav_info.setText(f"({n_dirs} dirs × {n_frames} frames)")
         self._status_lbl.setText(
-            f"Done — upscaled to {out_w}×{out_h} px"
-            f"  ({n_dirs} dirs × {n_frames} frames)"
+            f"Done — {out_w}×{out_h} px  ({n_dirs} dirs × {n_frames} frames)"
         )
         self._update_preview()
 
@@ -301,7 +342,6 @@ class UpscalerTab(QWidget):
         self._thread.quit()
         self._btn_run.setEnabled(True)
         self._progress.setVisible(False)
-        # Show first 200 chars to avoid flooding the label
         self._status_lbl.setText(f"Error: {msg[:200]}")
 
     # ── Selection / preview ───────────────────────────────────────────────
@@ -315,9 +355,20 @@ class UpscalerTab(QWidget):
         n_dirs, n_frames = char.frames.shape[0], char.frames.shape[1]
         self._frame_spin.setRange(1, n_frames)
         self._nav_info.setText(f"({n_dirs} dirs × {n_frames} frames)")
+
+        # Auto-detect an existing cache for whichever backend is selected
+        backend  = self._backend_combo.currentData()
+        cache_fp = _cache_path(char, backend)
+        if char.upscaled_frames is not None:
+            status = "upscaled frames already loaded"
+        elif os.path.exists(cache_fp):
+            status = f"cache found: {os.path.basename(cache_fp)}"
+        else:
+            status = "no cache — press Run to upscale"
+
         self._status_lbl.setText(
-            f"Ready — '{char.name}'  {n_dirs}d × {n_frames}f  "
-            f"{char.frames.shape[3]}×{char.frames.shape[2]} px"
+            f"'{char.name}'  {n_dirs}d × {n_frames}f  "
+            f"{char.frames.shape[3]}×{char.frames.shape[2]} px  —  {status}"
         )
         self._upscaled = getattr(char, "upscaled_frames", None)
         self._update_preview()
@@ -327,10 +378,10 @@ class UpscalerTab(QWidget):
         if char is None:
             return
 
-        d  = max(0, min(self._dir_spin.value() - 1,  char.frames.shape[0] - 1))
+        d  = max(0, min(self._dir_spin.value()   - 1, char.frames.shape[0] - 1))
         fi = max(0, min(self._frame_spin.value() - 1, char.frames.shape[1] - 1))
 
-        orig = char.frames[d, fi]                    # (H, W, 3)
+        orig = char.frames[d, fi]
         oh, ow = orig.shape[:2]
         self._orig_lbl.setPixmap(_rgb_to_pixmap(orig))
         self._orig_dim.setText(f"{ow}×{oh} px")
