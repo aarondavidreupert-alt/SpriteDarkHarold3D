@@ -4,6 +4,9 @@ Triangulates the 2D poses into a 3D skeleton, shows a rotatable
 pyqtgraph OpenGL skeleton viewer, and colour-codes back-projection error.
 """
 
+import sys
+import subprocess
+import logging
 import numpy as np
 
 from PyQt6.QtWidgets import (
@@ -15,6 +18,8 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 
 from gui.main_window import AppState
 from pipeline.pose_triangulator import POSE_CONNECTIONS
+
+_logger = logging.getLogger(__name__)
 
 # Optional pyqtgraph OpenGL
 try:
@@ -74,6 +79,41 @@ class TriangulationWorker(QObject):
 # 3D Viewer (pyqtgraph OpenGL)
 # -----------------------------------------------------------------------
 
+# -----------------------------------------------------------------------
+# Background installer for optional 3D deps
+# -----------------------------------------------------------------------
+
+class _InstallWorker(QObject):
+    finished = pyqtSignal(bool)   # True = success
+
+    def run(self):
+        _logger.info("Installing pyqtgraph and PyOpenGL…")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "pyqtgraph", "PyOpenGL"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True,
+            )
+            for line in proc.stdout:
+                stripped = line.rstrip()
+                if stripped:
+                    _logger.info("[pip] %s", stripped)
+            proc.wait()
+            if proc.returncode == 0:
+                _logger.info(
+                    "Install complete — restart the application to enable 3D view."
+                )
+                self.finished.emit(True)
+            else:
+                _logger.error("pip exited with code %d.", proc.returncode)
+                self.finished.emit(False)
+        except Exception as exc:
+            _logger.error("Install failed: %s", exc)
+            self.finished.emit(False)
+
+
+# -----------------------------------------------------------------------
+
 class SkeletonViewer3D(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -95,10 +135,37 @@ class SkeletonViewer3D(QWidget):
             layout.addWidget(self._view)
         else:
             layout.addWidget(QLabel(
-                "pyqtgraph not installed.\n"
-                "Run: pip install pyqtgraph PyOpenGL\n"
-                "to enable 3D visualisation."
+                "pyqtgraph / PyOpenGL not installed — 3D viewer disabled."
             ))
+            self._btn_install = QPushButton("Install pyqtgraph + PyOpenGL")
+            self._btn_install.clicked.connect(self._start_install)
+            layout.addWidget(self._btn_install)
+            self._install_lbl = QLabel("")
+            layout.addWidget(self._install_lbl)
+            layout.addStretch()
+            self._install_thread: QThread | None = None
+
+    def _start_install(self):
+        self._btn_install.setEnabled(False)
+        self._install_lbl.setText("Installing… check Console Log for progress.")
+        self._install_worker = _InstallWorker()
+        self._install_thread = QThread(self)
+        self._install_worker.moveToThread(self._install_thread)
+        self._install_thread.started.connect(self._install_worker.run)
+        self._install_worker.finished.connect(self._on_install_done)
+        self._install_thread.start()
+
+    def _on_install_done(self, success: bool):
+        self._install_thread.quit()
+        if success:
+            self._install_lbl.setText(
+                "Restart the application to enable 3D view."
+            )
+        else:
+            self._btn_install.setEnabled(True)
+            self._install_lbl.setText(
+                "Install failed — see Console Log for details."
+            )
 
     def set_skeleton(self, skeleton: np.ndarray, errors: np.ndarray | None = None):
         """
@@ -187,6 +254,14 @@ class ReconstructionTab(QWidget):
         from pipeline import PoseTriangulator
         self._triangulator = PoseTriangulator()
         self._skeleton_sequence: np.ndarray | None = None  # (N, 33, 3)
+
+        if not _GL_AVAILABLE:
+            _logger.warning(
+                "pyqtgraph/PyOpenGL not installed — 3D viewer disabled. "
+                "Click 'Install' in the Reconstruction tab or run: "
+                "pip install pyqtgraph PyOpenGL"
+            )
+
         self._build_ui()
 
         self.state.selection_changed.connect(self._on_char_changed)

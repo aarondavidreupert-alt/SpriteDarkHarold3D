@@ -15,6 +15,28 @@ import sys
 import os
 
 # ---------------------------------------------------------------------------
+# Redirect print() / traceback output into the logging system so every
+# print() call appears in the GUI console panel automatically.
+# Installed before MainWindow so it is in place for all pipeline code.
+# ---------------------------------------------------------------------------
+import logging as _logging
+
+class _PrintToLog:
+    def __init__(self, level: int):
+        self._level  = level
+        self._logger = _logging.getLogger("stdout")
+
+    def write(self, msg: str):
+        if msg.strip():
+            self._logger.log(self._level, msg.rstrip())
+
+    def flush(self):
+        pass
+
+sys.stdout = _PrintToLog(_logging.INFO)
+sys.stderr = _PrintToLog(_logging.ERROR)
+
+# ---------------------------------------------------------------------------
 # Compatibility shim — torchvision ≥0.17 removed functional_tensor.py but
 # basicsr still imports from it.  Patch the missing module before anything
 # else loads so no manual file editing is ever needed after reinstalls.
