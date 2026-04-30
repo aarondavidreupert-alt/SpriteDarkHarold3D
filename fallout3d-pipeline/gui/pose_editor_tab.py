@@ -223,6 +223,15 @@ class DetectionWorker(QObject):
             return
 
         try:
+            from mediapipe.tasks import python as _mptasks
+            from mediapipe.tasks.python import vision as _mpvision
+        except Exception as exc:
+            msg = f"mediapipe Tasks API unavailable: {exc}"
+            _logger.error(msg)
+            self.error.emit(msg)
+            return
+
+        try:
             frames = (
                 self.char.upscaled_frames
                 if self.char.upscaled_frames is not None
@@ -236,30 +245,31 @@ class DetectionWorker(QObject):
             poses_out = np.zeros((n_frames, n_dirs, 33, 3))
             annotated = np.zeros((n_dirs, n_frames, h, w, 3), dtype=np.uint8)
 
-            # Try Holistic first (face + body + hands); fall back to Pose only
-            try:
-                detector_ctx = mp.solutions.holistic.Holistic(
-                    static_image_mode=True, min_detection_confidence=0.5
-                )
-                mode = "holistic"
-            except AttributeError:
-                detector_ctx = mp.solutions.pose.Pose(
-                    static_image_mode=True, min_detection_confidence=0.5
-                )
-                mode = "pose"
+            # Reuse the model that pose_triangulator already manages
+            import os
+            from pipeline.pose_triangulator import _MODEL_PATH, _MODEL_URL, _MODEL_DIR
+            if not os.path.exists(_MODEL_PATH):
+                import urllib.request
+                os.makedirs(_MODEL_DIR, exist_ok=True)
+                _logger.info("Downloading pose model to %s …", _MODEL_PATH)
+                urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+
+            options = _mpvision.PoseLandmarkerOptions(
+                base_options=_mptasks.BaseOptions(model_asset_path=_MODEL_PATH),
+                running_mode=_mpvision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
 
             _logger.info(
                 "Starting detection — %d views × %d frames (%d×%d px) "
-                "using MediaPipe %s",
-                n_dirs, n_frames, w, h, mode,
+                "using MediaPipe Tasks PoseLandmarker",
+                n_dirs, n_frames, w, h,
             )
 
-            drawing       = mp.solutions.drawing_utils
-            pose_cx       = mp.solutions.pose.POSE_CONNECTIONS
-            lm_spec       = drawing.DrawingSpec(color=(0, 180, 0),   thickness=1, circle_radius=2)
-            conn_spec     = drawing.DrawingSpec(color=(200, 200, 200), thickness=1)
-
-            with detector_ctx as detector:
+            with _mpvision.PoseLandmarker.create_from_options(options) as detector:
                 for frame_idx in range(n_frames):
                     n_detected = 0
                     for dir_idx in range(n_dirs):
@@ -271,18 +281,29 @@ class DetectionWorker(QObject):
                                 else img_rgb.astype(np.uint8)
                             )
 
-                        result   = detector.process(img_rgb)
-                        pose_lms = result.pose_landmarks
+                        mp_img = mp.Image(
+                            image_format=mp.ImageFormat.SRGB,
+                            data=np.ascontiguousarray(img_rgb),
+                        )
+                        result   = detector.detect(mp_img)
 
-                        # draw_landmarks expects BGR; convert, draw, convert back
-                        img_bgr = img_rgb[..., ::-1].copy()
-                        if pose_lms is not None:
-                            drawing.draw_landmarks(
-                                img_bgr, pose_lms, pose_cx, lm_spec, conn_spec
-                            )
-                            for lm_idx, lm in enumerate(pose_lms.landmark):
+                        ann_img = img_rgb.copy()
+                        if result.pose_landmarks:
+                            lms = result.pose_landmarks[0]
+                            # Draw skeleton connections using POSE_CONNECTIONS
+                            for s, e in POSE_CONNECTIONS:
+                                if s >= len(lms) or e >= len(lms):
+                                    continue
+                                x0 = max(0, min(int(lms[s].x * w), w - 1))
+                                y0 = max(0, min(int(lms[s].y * h), h - 1))
+                                x1 = max(0, min(int(lms[e].x * w), w - 1))
+                                y1 = max(0, min(int(lms[e].y * h), h - 1))
+                                cv2.line(ann_img, (x0, y0), (x1, y1), (200, 200, 200), 1)
+                            # Draw landmark dots and record positions
+                            for lm_idx, lm in enumerate(lms):
                                 px = max(0, min(int(lm.x * w), w - 1))
                                 py = max(0, min(int(lm.y * h), h - 1))
+                                cv2.circle(ann_img, (px, py), 2, (0, 180, 0), -1)
                                 poses_out[frame_idx, dir_idx, lm_idx] = [
                                     px, py, lm.visibility
                                 ]
@@ -297,7 +318,7 @@ class DetectionWorker(QObject):
                                 frame_idx, dir_idx,
                             )
 
-                        annotated[dir_idx, frame_idx] = img_bgr[..., ::-1]
+                        annotated[dir_idx, frame_idx] = ann_img
 
                     _logger.info(
                         "Frame %d/%d — pose in %d/%d views",
@@ -305,7 +326,7 @@ class DetectionWorker(QObject):
                     )
                     self.progress.emit(frame_idx + 1, n_frames)
 
-            self.char.poses_2d        = poses_out
+            self.char.poses_2d         = poses_out
             self.char.annotated_frames = annotated
 
             z     = np.abs(poses_out[:, :, :, 2])
