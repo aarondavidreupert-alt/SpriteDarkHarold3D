@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QLineEdit, QSpinBox, QSlider,
 )
 from PyQt6.QtGui import QPixmap, QImage, QColor
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject
 
 from gui.main_window import AppState, CharacterData, CRITTER_CATEGORIES
 
@@ -225,17 +225,49 @@ class ThumbnailGrid(QScrollArea):
 # -----------------------------------------------------------------------
 
 class _DirectionRow(QWidget):
-    """One direction row: frame display + spinbox/slider scrubber."""
+    """One direction row: canvas-registered frame display + scrubber + flip button."""
 
     DISPLAY_SIZE = 160      # max px for frame thumbnail
 
     def __init__(self, dir_idx, frame_pixels, frame_offsets, pal_table, parent=None):
         super().__init__(parent)
-        self._pixels  = frame_pixels   # list[np.ndarray]  (1-D indexed)
-        self._offsets = frame_offsets  # list[dict]  with 'w' / 'h'
-        self._pal     = pal_table      # (256, 3) uint8
-        self._n       = len(frame_pixels)
+        self._n = len(frame_pixels)
+        self._current_idx = 0
+        self._flipped = False
 
+        # 'x'/'y' in frame_offsets are per-frame deltas — accumulate to absolute.
+        abs_x, abs_y = [], []
+        ox = oy = 0
+        for fo in frame_offsets:
+            ox += fo['x']
+            oy += fo['y']
+            abs_x.append(ox)
+            abs_y.append(oy)
+
+        # Normalize so the earliest composite position is at (0, 0).
+        min_x = min(abs_x) if abs_x else 0
+        min_y = min(abs_y) if abs_y else 0
+        abs_x = [v - min_x for v in abs_x]
+        abs_y = [v - min_y for v in abs_y]
+        self._abs_x = abs_x
+        self._abs_y = abs_y
+
+        # Canvas large enough to hold every frame at its registered position.
+        self._canvas_w = max(abs_x[fi] + frame_offsets[fi]['w'] for fi in range(self._n))
+        self._canvas_h = max(abs_y[fi] + frame_offsets[fi]['h'] for fi in range(self._n))
+
+        # Pre-composite all frames onto RGBA canvases.
+        self._canvases = []
+        for fi in range(self._n):
+            fo = frame_offsets[fi]
+            fw, fh = fo['w'], fo['h']
+            ox_i, oy_i = abs_x[fi], abs_y[fi]
+            canvas = np.zeros((self._canvas_h, self._canvas_w, 4), dtype=np.uint8)
+            indices = frame_pixels[fi].reshape(fh, fw)
+            canvas[oy_i:oy_i+fh, ox_i:ox_i+fw] = _indices_to_rgba(indices, pal_table)
+            self._canvases.append(canvas)
+
+        # Build UI
         lay = QHBoxLayout(self)
         lay.setContentsMargins(4, 2, 4, 2)
 
@@ -243,11 +275,19 @@ class _DirectionRow(QWidget):
         dir_lbl.setFixedWidth(44)
         lay.addWidget(dir_lbl)
 
+        img_col = QVBoxLayout()
         self._img = QLabel()
         self._img.setFixedSize(self.DISPLAY_SIZE, self.DISPLAY_SIZE)
         self._img.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._img.setStyleSheet("background:#111;border:1px solid #444;")
-        lay.addWidget(self._img)
+        img_col.addWidget(self._img)
+
+        self._info_lbl = QLabel("")
+        self._info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_lbl.setStyleSheet("font-size: 9px; color: #888;")
+        img_col.addWidget(self._info_lbl)
+
+        lay.addLayout(img_col)
 
         ctrl = QVBoxLayout()
 
@@ -266,6 +306,11 @@ class _DirectionRow(QWidget):
         scrub.addWidget(self._slider)
 
         ctrl.addLayout(scrub)
+
+        self._btn_flip = QPushButton("↔ Flip L/R")
+        self._btn_flip.clicked.connect(self._flip)
+        ctrl.addWidget(self._btn_flip)
+
         lay.addLayout(ctrl)
 
         self._spin.valueChanged.connect(self._on_spin)
@@ -286,27 +331,40 @@ class _DirectionRow(QWidget):
         self._spin.blockSignals(False)
         self._show(v)
 
+    def _flip(self):
+        self._flipped = not self._flipped
+        self._canvases = [np.fliplr(c) for c in self._canvases]
+        self._btn_flip.setText("↩ Unflip" if self._flipped else "↔ Flip L/R")
+        self._show(self._current_idx)
+
     def _show(self, idx):
-        fo = self._offsets[idx]
-        w, h = fo['w'], fo['h']
-        indices = self._pixels[idx].reshape(h, w)
-        rgba = _indices_to_rgba(indices, self._pal)
-        pix  = _to_pixmap(rgba).scaled(
+        self._current_idx = idx
+        pix = _to_pixmap(self._canvases[idx]).scaled(
             self.DISPLAY_SIZE, self.DISPLAY_SIZE,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation,
         )
         self._img.setPixmap(pix)
         self._counter.setText(f"{idx + 1} / {self._n}")
+        ox, oy = self._abs_x[idx], self._abs_y[idx]
+        self._info_lbl.setText(
+            f"Canvas: {self._canvas_w}×{self._canvas_h}  |  "
+            f"Frame offset: ({ox}, {oy})"
+        )
 
 
 class FrmViewerPanel(QGroupBox):
-    """Load FRM → display all directions with per-direction frame scrubbers."""
+    """Load FRM → display all directions with per-direction frame scrubbers and global playback."""
 
     def __init__(self, pal_path: str, parent=None):
         super().__init__("FRM Viewer", parent)
         self._pal_path  = pal_path
         self._pal_table = self._init_palette()
+        self._rows: list[_DirectionRow] = []
+        self._n_frames = 0
+        self._global_frame = 0
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
         self._build_ui()
 
     def _init_palette(self) -> np.ndarray:
@@ -318,6 +376,7 @@ class FrmViewerPanel(QGroupBox):
     def _build_ui(self):
         lay = QVBoxLayout(self)
 
+        # Load controls
         top = QHBoxLayout()
         self._btn_load = QPushButton("Load FRM…")
         self._btn_load.clicked.connect(self._open)
@@ -327,6 +386,31 @@ class FrmViewerPanel(QGroupBox):
         self._info_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         top.addWidget(self._info_lbl, 1)
         lay.addLayout(top)
+
+        # Global playback toolbar
+        pb_bar = QHBoxLayout()
+        self._btn_play = QPushButton("▶ Play All")
+        self._btn_play.setCheckable(True)
+        self._btn_play.setFixedWidth(88)
+        self._btn_play.toggled.connect(self._on_play_toggled)
+        pb_bar.addWidget(self._btn_play)
+
+        pb_bar.addWidget(QLabel("Speed:"))
+        self._fps_slider = QSlider(Qt.Orientation.Horizontal)
+        self._fps_slider.setRange(1, 24)
+        self._fps_slider.setValue(8)
+        self._fps_slider.setFixedWidth(110)
+        self._fps_slider.valueChanged.connect(self._on_fps_changed)
+        pb_bar.addWidget(self._fps_slider)
+
+        self._fps_lbl = QLabel("8 fps")
+        self._fps_lbl.setFixedWidth(44)
+        pb_bar.addWidget(self._fps_lbl)
+
+        self._sync_lbl = QLabel("Frame — / —")
+        self._sync_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        pb_bar.addWidget(self._sync_lbl, 1)
+        lay.addLayout(pb_bar)
 
         # Scrollable area that holds one _DirectionRow per direction
         self._scroll = QScrollArea()
@@ -348,6 +432,9 @@ class FrmViewerPanel(QGroupBox):
             self._load(path)
 
     def _load(self, path: str):
+        self._play_timer.stop()
+        self._btn_play.setChecked(False)
+        self._btn_play.setText("▶ Play All")
         try:
             with open(path, "rb") as f:
                 info = _frmpixels.readFRMInfo(f, exportImage=True)
@@ -357,17 +444,21 @@ class FrmViewerPanel(QGroupBox):
 
         n_dirs   = info['numDirections']
         n_frames = info['numFrames']
+        self._n_frames = n_frames
+        self._global_frame = 0
         self._info_lbl.setText(
             f"{os.path.basename(path)}  —  "
             f"{n_dirs} dir{'s' if n_dirs != 1 else ''} "
             f"× {n_frames} frame{'s' if n_frames != 1 else ''}"
         )
+        self._sync_lbl.setText(f"Frame 1 / {n_frames}")
 
         # Remove old direction rows (everything except the trailing stretch)
         while self._rows_layout.count() > 1:
             item = self._rows_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self._rows = []
 
         for d in range(n_dirs):
             row = _DirectionRow(
@@ -378,6 +469,33 @@ class FrmViewerPanel(QGroupBox):
                 self._rows_container,
             )
             self._rows_layout.insertWidget(d, row)
+            self._rows.append(row)
+
+    def _on_play_toggled(self, playing: bool):
+        if playing:
+            if self._n_frames == 0:
+                self._btn_play.setChecked(False)
+                return
+            self._btn_play.setText("⏸ Pause")
+            self._play_timer.start(max(1, 1000 // self._fps_slider.value()))
+        else:
+            self._btn_play.setText("▶ Play All")
+            self._play_timer.stop()
+
+    def _on_fps_changed(self, fps: int):
+        self._fps_lbl.setText(f"{fps} fps")
+        if self._play_timer.isActive():
+            self._play_timer.setInterval(max(1, 1000 // fps))
+
+    def _play_tick(self):
+        if self._n_frames == 0 or not self._rows:
+            self._btn_play.setChecked(False)
+            return
+        self._global_frame = (self._global_frame + 1) % self._n_frames
+        fi = self._global_frame
+        for row in self._rows:
+            row._slider.setValue(fi)   # triggers _on_slide → _show
+        self._sync_lbl.setText(f"Frame {fi + 1} / {self._n_frames}")
 
 
 # -----------------------------------------------------------------------
