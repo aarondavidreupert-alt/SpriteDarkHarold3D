@@ -138,6 +138,7 @@ class MainWindow(QMainWindow):
 
     def _build_tabs(self):
         from gui.asset_loader_tab import AssetLoaderTab
+        from gui.frm_viewer_tab import FrmViewerTab
         from gui.upscaler_tab import UpscalerTab
         from gui.pose_editor_tab import PoseEditorTab
         from gui.reconstruction_tab import ReconstructionTab
@@ -150,6 +151,7 @@ class MainWindow(QMainWindow):
         self.tabs.setMovable(False)
 
         self.tab_asset       = AssetLoaderTab(self.state, self)
+        self.tab_frm_viewer  = FrmViewerTab(self.state, self)
         self.tab_upscaler    = UpscalerTab(self.state, self)
         self.tab_pose        = PoseEditorTab(self.state, self)
         self.tab_recon       = ReconstructionTab(self.state, self)
@@ -157,13 +159,14 @@ class MainWindow(QMainWindow):
         self.tab_mesh        = MeshTab(self.state, self)
         self.tab_export      = ExportTab(self.state, self)
 
-        self.tabs.addTab(self.tab_asset,    "1 · Asset Loader")
-        self.tabs.addTab(self.tab_upscaler, "2 · Upscaler")
-        self.tabs.addTab(self.tab_pose,     "3 · Pose Editor")
-        self.tabs.addTab(self.tab_recon,    "4 · 3D Reconstruction")
-        self.tabs.addTab(self.tab_library,  "5 · Pose Library")
-        self.tabs.addTab(self.tab_mesh,     "6 · Mesh & Normals")
-        self.tabs.addTab(self.tab_export,   "7 · Export")
+        self.tabs.addTab(self.tab_asset,       "1 · Asset Loader")
+        self.tabs.addTab(self.tab_frm_viewer,  "1b · FRM Viewer")
+        self.tabs.addTab(self.tab_upscaler,    "2 · Upscaler")
+        self.tabs.addTab(self.tab_pose,        "3 · Pose Editor")
+        self.tabs.addTab(self.tab_recon,       "4 · 3D Reconstruction")
+        self.tabs.addTab(self.tab_library,     "5 · Pose Library")
+        self.tabs.addTab(self.tab_mesh,        "6 · Mesh & Normals")
+        self.tabs.addTab(self.tab_export,      "7 · Export")
 
         # Central widget is set in _build_console() via a QSplitter
 
@@ -204,7 +207,7 @@ class MainWindow(QMainWindow):
         act_run = QAction("Run Detection", self)
         act_run.setShortcut("Ctrl+R")
         act_run.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(2),
+            self.tabs.setCurrentIndex(3),
             self.tab_pose.run_detection(),
         ))
         tb.addAction(act_run)
@@ -212,7 +215,7 @@ class MainWindow(QMainWindow):
         act_tri = QAction("Triangulate", self)
         act_tri.setShortcut("Ctrl+T")
         act_tri.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(3),
+            self.tabs.setCurrentIndex(4),
             self.tab_recon.run_triangulation(),
         ))
         tb.addAction(act_tri)
@@ -220,7 +223,7 @@ class MainWindow(QMainWindow):
         act_exp = QAction("Export GLB…", self)
         act_exp.setShortcut("Ctrl+E")
         act_exp.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(6),
+            self.tabs.setCurrentIndex(7),
             self.tab_export.export_glb(),
         ))
         tb.addAction(act_exp)
@@ -228,6 +231,7 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, idx: int):
         labels = [
             "Load critter sprites (.npy / .png / .frm)",
+            "Preview and verify FRM frame registration",
             "Upscale frames with Real-ESRGAN",
             "Inspect and correct 2D pose landmarks",
             "Run 3D triangulation and inspect skeleton",
