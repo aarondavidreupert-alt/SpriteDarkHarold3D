@@ -48,6 +48,7 @@ class CharacterData:
     upscaled_frames: Optional[np.ndarray] = None    # (6, N, H', W', 3) after upscaling
     annotated_frames: Optional[np.ndarray] = None   # (6, N, H, W, 3) with MP overlay
     source_path: Optional[str] = None               # original file path for cache naming
+    frm_offsets: Optional[list] = None              # [dir][frame] (ox, oy) int tuples — FRM only
     color: Tuple[float, float, float] = (1.0, 0.8, 0.2)
 
     @property

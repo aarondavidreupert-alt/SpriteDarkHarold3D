@@ -56,37 +56,37 @@ PART_COLORS = {
     "legs":  (255, 255, 0),
 }
 
-# Pairs that get swapped on a left/right flip
+# Pairs that get swapped on a left/right flip — kept for backward compat
 _FLIP_PAIRS = [(11, 12), (13, 14), (15, 16), (23, 24),
                (7, 8), (9, 10), (1, 4), (2, 5), (3, 6)]
 
-_SQRT2 = math.sqrt(2)
+# Per-direction expected pixel-space vector from right_shoulder (LM12) → left_shoulder (LM11).
+# x: rightward, y: downward. Derived from Fallout 2 isometric camera geometry.
+DIR_EXPECTED_RL = [
+    np.array([-1.0,  0.0]),  # Dir 1 (idx 0) NE — back to camera
+    np.array([ 0.0, -1.0]),  # Dir 2 (idx 1) E  — right profile
+    np.array([ 1.0,  0.0]),  # Dir 3 (idx 2) SE — facing camera
+    np.array([ 1.0,  0.0]),  # Dir 4 (idx 3) SW — facing camera
+    np.array([ 0.0,  1.0]),  # Dir 5 (idx 4) W  — left profile
+    np.array([-1.0,  0.0]),  # Dir 6 (idx 5) NW — back to camera
+]
 
-# Expected right_shoulder→left_shoulder direction per isometric view (unit vectors)
-DIR_EXPECTED_SHOULDER = {
-    0: np.array([ 1.0, -1.0]) / _SQRT2,  # NE
-    1: np.array([ 1.0,  0.0]),            # E
-    2: np.array([ 1.0,  1.0]) / _SQRT2,  # SE
-    3: np.array([-1.0,  1.0]) / _SQRT2,  # SW
-    4: np.array([-1.0,  0.0]),            # W
-    5: np.array([-1.0, -1.0]) / _SQRT2,  # NW
-}
+_FLIP_PAIRS_UPPER = [(11,12),(13,14),(15,16),(7,8),(9,10),(1,4),(2,5),(3,6)]
+_FLIP_PAIRS_LOWER = [(23,24),(25,26),(27,28),(29,30),(31,32)]
 
-_UPPER_FLIP_PAIRS = [(11, 12), (13, 14), (15, 16), (7, 8), (1, 4), (2, 5), (3, 6)]
-_LOWER_FLIP_PAIRS = [(23, 24), (25, 26), (27, 28), (29, 30), (31, 32)]
-
+# Anatomical side per MediaPipe 33-landmark schema
 LANDMARK_SIDE: dict = {}
-for _i in [11, 13, 15, 23, 25, 27, 29, 31, 1, 2, 3, 7, 9]:
+for _i in [11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31]:
     LANDMARK_SIDE[_i] = "left"
-for _i in [12, 14, 16, 24, 26, 28, 30, 32, 4, 5, 6, 8, 10]:
+for _i in [12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]:
     LANDMARK_SIDE[_i] = "right"
-for _i in [0] + list(range(17, 23)):
+for _i in range(11):  # 0-10 face/mid-body
     LANDMARK_SIDE[_i] = "center"
 
 _SIDE_DOT_COLORS = {
-    "left":   (0, 100, 255),
-    "right":  (255, 60, 60),
-    "center": (255, 255, 255),
+    "left":   (220,  80,  80),  # red
+    "right":  ( 80,  80, 220),  # blue
+    "center": (200, 200, 200),  # grey
 }
 
 
@@ -116,6 +116,7 @@ class PoseTriangulator:
         )
         self.frames: np.ndarray | None = None          # (6, N, H, W, 3)
         self.poses_sequence: np.ndarray | None = None  # (N, 6, 33, 3)
+        self.pad_pixels: int = 40   # black border added before MediaPipe detection
 
         self._pose_detector = None  # lazy-initialised
 
@@ -148,6 +149,20 @@ class PoseTriangulator:
         return self._pose_detector
 
     # ------------------------------------------------------------------
+    # Padding helper
+    # ------------------------------------------------------------------
+
+    def _pad_frame(self, img: np.ndarray) -> tuple[np.ndarray, int, int]:
+        """Add black border so MediaPipe has context pixels around tight crops.
+
+        Returns (padded_image, pad_top, pad_left) so callers can subtract the
+        offset from detected coordinates to get back into original image space.
+        """
+        p = self.pad_pixels
+        padded = cv2.copyMakeBorder(img, p, p, p, p, cv2.BORDER_CONSTANT, value=0)
+        return padded, p, p
+
+    # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------
 
@@ -161,23 +176,30 @@ class PoseTriangulator:
     # ------------------------------------------------------------------
 
     def _correct_flip(self, pose_2d: np.ndarray, perspective_idx: int) -> np.ndarray:
-        """Independently correct upper-body (shoulder) and lower-body (hip) flips."""
-        expected  = DIR_EXPECTED_SHOULDER[perspective_idx % 6]
+        """
+        Independently correct left/right flip for upper and lower body.
+        Uses direction-specific expected shoulder/hip vectors for Fallout 2
+        isometric perspective. Upper and lower body are checked separately
+        because mid-stride poses can have correct shoulders but flipped hips.
+        """
+        expected  = DIR_EXPECTED_RL[perspective_idx % 6]
         corrected = pose_2d.copy()
 
+        # --- Upper body ---
         left_sh, right_sh = corrected[11], corrected[12]
         if not (np.all(left_sh == 0) or np.all(right_sh == 0)):
-            seg = right_sh[:2] - left_sh[:2]
-            if np.dot(seg, expected) < 0:
-                for l, r in _UPPER_FLIP_PAIRS:
-                    corrected[l], corrected[r] = corrected[r].copy(), corrected[l].copy()
+            vec = left_sh[:2] - right_sh[:2]   # right → left
+            if np.dot(vec, expected) < 0:
+                for a, b in _FLIP_PAIRS_UPPER:
+                    corrected[a], corrected[b] = corrected[b].copy(), corrected[a].copy()
 
+        # --- Lower body (independent check) ---
         left_hip, right_hip = corrected[23], corrected[24]
         if not (np.all(left_hip == 0) or np.all(right_hip == 0)):
-            seg = right_hip[:2] - left_hip[:2]
-            if np.dot(seg, expected) < 0:
-                for l, r in _LOWER_FLIP_PAIRS:
-                    corrected[l], corrected[r] = corrected[r].copy(), corrected[l].copy()
+            vec = left_hip[:2] - right_hip[:2]  # right → left
+            if np.dot(vec, expected) < 0:
+                for a, b in _FLIP_PAIRS_LOWER:
+                    corrected[a], corrected[b] = corrected[b].copy(), corrected[a].copy()
 
         return corrected
 
@@ -213,17 +235,23 @@ class PoseTriangulator:
                 elif img.shape[2] == 4:
                     img = img[:, :, :3]
 
+                img_padded, pad_top, pad_left = self._pad_frame(img)
+                h_pad, w_pad = img_padded.shape[:2]
+
                 mp_image = mp.Image(
                     image_format=mp.ImageFormat.SRGB,
-                    data=np.ascontiguousarray(img),
+                    data=np.ascontiguousarray(img_padded),
                 )
                 result = detector.detect(mp_image)
 
                 if result.pose_landmarks:
                     lms = np.array([
-                        [*_normalized_to_pixel(lm.x, lm.y, w, h), lm.z]
+                        [*_normalized_to_pixel(lm.x, lm.y, w_pad, h_pad), lm.z]
                         for lm in result.pose_landmarks[0]
                     ], dtype=float)
+                    # Subtract padding to restore original image coordinates
+                    lms[:, 0] = np.clip(lms[:, 0] - pad_left, 0, w - 1)
+                    lms[:, 1] = np.clip(lms[:, 1] - pad_top,  0, h - 1)
                     lms = self._correct_flip(lms, persp_idx)
                 else:
                     lms = np.zeros((33, 3))
