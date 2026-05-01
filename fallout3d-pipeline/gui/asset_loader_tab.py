@@ -109,51 +109,43 @@ class LoadWorker(QObject):
                 offsets  = info['frameOffsets']   # [dir][frame] → {'x','y','w','h'}
                 pixels   = info['framePixels']    # [dir][frame] → 1-D np.uint8
 
-                # frmpixels 'x'/'y' are per-frame deltas — accumulate to get
-                # absolute position (same logic as exportFRM in frmpixels.py).
-                cum_x = [[0] * n_frames for _ in range(n_dirs)]
-                cum_y = [[0] * n_frames for _ in range(n_dirs)]
-                for d in range(n_dirs):
-                    ox, oy = 0, 0
-                    for fi in range(n_frames):
-                        ox += offsets[d][fi]['x']
-                        oy += offsets[d][fi]['y']
-                        cum_x[d][fi] = ox
-                        cum_y[d][fi] = oy
+                # Anchor formula from LoadDataJson2.py: feet stay at (anchor_x, anchor_y).
+                CANVAS_W = 200
+                CANVAS_H = 200
+                anchor_x = CANVAS_W // 2
+                anchor_y = CANVAS_H * 3 // 4
 
-                # Shift so the minimum offset lands at (0, 0)
-                min_x = min(cum_x[d][fi] for d in range(n_dirs) for fi in range(n_frames))
-                min_y = min(cum_y[d][fi] for d in range(n_dirs) for fi in range(n_frames))
-                abs_x = [[cum_x[d][fi] - min_x for fi in range(n_frames)] for d in range(n_dirs)]
-                abs_y = [[cum_y[d][fi] - min_y for fi in range(n_frames)] for d in range(n_dirs)]
-
-                # Canvas large enough to hold every frame at its registered position
-                canvas_w = max(
-                    abs_x[d][fi] + offsets[d][fi]['w']
-                    for d in range(n_dirs) for fi in range(n_frames)
-                )
-                canvas_h = max(
-                    abs_y[d][fi] + offsets[d][fi]['h']
-                    for d in range(n_dirs) for fi in range(n_frames)
-                )
                 self.progress.emit(
-                    f"FRM canvas {canvas_w}×{canvas_h} px "
+                    f"FRM {CANVAS_W}×{CANVAS_H} canvas "
                     f"({n_dirs} dirs × {n_frames} frames)…"
                 )
 
-                frames = np.zeros((6, n_frames, canvas_h, canvas_w, 3), dtype=np.uint8)
-                for d in range(n_dirs):
-                    for fi in range(n_frames):
-                        fo   = offsets[d][fi]
-                        fw, fh = fo['w'], fo['h']
-                        ox, oy = abs_x[d][fi], abs_y[d][fi]
-                        idx  = pixels[d][fi].reshape(fh, fw)
-                        frames[d, fi, oy:oy+fh, ox:ox+fw] = pal_table[idx]
+                frames = np.zeros((6, n_frames, CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
 
-                frm_offsets = [
-                    [(abs_x[d][fi], abs_y[d][fi]) for fi in range(n_frames)]
-                    for d in range(n_dirs)
-                ]
+                for d in range(n_dirs):
+                    ox, oy = 0, 0
+                    for fi in range(n_frames):
+                        fo = offsets[d][fi]
+                        fw, fh = fo['w'], fo['h']
+                        ox += fo['x']
+                        oy += fo['y']
+
+                        left = anchor_x - (fw // 2 - ox)
+                        top  = anchor_y - (fh - oy)
+
+                        x0 = max(left, 0)
+                        y0 = max(top, 0)
+                        x1 = min(left + fw, CANVAS_W)
+                        y1 = min(top + fh, CANVAS_H)
+                        sx0 = x0 - left
+                        sy0 = y0 - top
+
+                        if x1 > x0 and y1 > y0:
+                            idx = pixels[d][fi].reshape(fh, fw)
+                            frames[d, fi, y0:y1, x0:x1] = \
+                                pal_table[idx[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]]
+
+                frm_offsets = None  # fixed canvas; per-frame offsets no longer needed
 
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
@@ -235,36 +227,35 @@ class _DirectionRow(QWidget):
         self._current_idx = 0
         self._flipped = False
 
-        # 'x'/'y' in frame_offsets are per-frame deltas — accumulate to absolute.
-        abs_x, abs_y = [], []
-        ox = oy = 0
-        for fo in frame_offsets:
-            ox += fo['x']
-            oy += fo['y']
-            abs_x.append(ox)
-            abs_y.append(oy)
+        # Anchor formula from LoadDataJson2.py: feet stay at (anchor_x, anchor_y).
+        CANVAS_W = 200
+        CANVAS_H = 200
+        anchor_x = CANVAS_W // 2
+        anchor_y = CANVAS_H * 3 // 4
 
-        # Normalize so the earliest composite position is at (0, 0).
-        min_x = min(abs_x) if abs_x else 0
-        min_y = min(abs_y) if abs_y else 0
-        abs_x = [v - min_x for v in abs_x]
-        abs_y = [v - min_y for v in abs_y]
-        self._abs_x = abs_x
-        self._abs_y = abs_y
+        self._canvas_w = CANVAS_W
+        self._canvas_h = CANVAS_H
 
-        # Canvas large enough to hold every frame at its registered position.
-        self._canvas_w = max(abs_x[fi] + frame_offsets[fi]['w'] for fi in range(self._n))
-        self._canvas_h = max(abs_y[fi] + frame_offsets[fi]['h'] for fi in range(self._n))
-
-        # Pre-composite all frames onto RGBA canvases.
+        # Pre-composite all frames onto fixed-size RGBA canvases.
         self._canvases = []
+        ox, oy = 0, 0
         for fi in range(self._n):
             fo = frame_offsets[fi]
             fw, fh = fo['w'], fo['h']
-            ox_i, oy_i = abs_x[fi], abs_y[fi]
-            canvas = np.zeros((self._canvas_h, self._canvas_w, 4), dtype=np.uint8)
-            indices = frame_pixels[fi].reshape(fh, fw)
-            canvas[oy_i:oy_i+fh, ox_i:ox_i+fw] = _indices_to_rgba(indices, pal_table)
+            ox += fo['x']
+            oy += fo['y']
+
+            left = anchor_x - (fw // 2 - ox)
+            top  = anchor_y - (fh - oy)
+
+            canvas = np.zeros((CANVAS_H, CANVAS_W, 4), dtype=np.uint8)
+            x0 = max(left, 0);  y0 = max(top, 0)
+            x1 = min(left + fw, CANVAS_W);  y1 = min(top + fh, CANVAS_H)
+            sx0 = x0 - left;  sy0 = y0 - top
+            if x1 > x0 and y1 > y0:
+                indices = frame_pixels[fi].reshape(fh, fw)
+                canvas[y0:y1, x0:x1] = _indices_to_rgba(
+                    indices[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)], pal_table)
             self._canvases.append(canvas)
 
         # Build UI
@@ -346,11 +337,7 @@ class _DirectionRow(QWidget):
         )
         self._img.setPixmap(pix)
         self._counter.setText(f"{idx + 1} / {self._n}")
-        ox, oy = self._abs_x[idx], self._abs_y[idx]
-        self._info_lbl.setText(
-            f"Canvas: {self._canvas_w}×{self._canvas_h}  |  "
-            f"Frame offset: ({ox}, {oy})"
-        )
+        self._info_lbl.setText(f"Canvas: {self._canvas_w}×{self._canvas_h}")
 
 
 class FrmViewerPanel(QGroupBox):
