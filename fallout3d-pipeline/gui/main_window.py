@@ -141,6 +141,7 @@ class MainWindow(QMainWindow):
         from gui.frm_viewer_tab import FrmViewerTab
         from gui.upscaler_tab import UpscalerTab
         from gui.pose_editor_tab import PoseEditorTab
+        from gui.pose_editor_tab2 import PoseManualEditorTab
         from gui.reconstruction_tab import ReconstructionTab
         from gui.pose_library_tab import PoseLibraryTab
         from gui.mesh_tab import MeshTab
@@ -150,23 +151,25 @@ class MainWindow(QMainWindow):
         self.tabs.setTabPosition(QTabWidget.TabPosition.North)
         self.tabs.setMovable(False)
 
-        self.tab_asset       = AssetLoaderTab(self.state, self)
-        self.tab_frm_viewer  = FrmViewerTab(self.state, self)
-        self.tab_upscaler    = UpscalerTab(self.state, self)
-        self.tab_pose        = PoseEditorTab(self.state, self)
-        self.tab_recon       = ReconstructionTab(self.state, self)
-        self.tab_library     = PoseLibraryTab(self.state, self)
-        self.tab_mesh        = MeshTab(self.state, self)
-        self.tab_export      = ExportTab(self.state, self)
+        self.tab_asset            = AssetLoaderTab(self.state, self)
+        self.tab_frm_viewer       = FrmViewerTab(self.state, self)
+        self.tab_upscaler         = UpscalerTab(self.state, self)
+        self.tab_pose             = PoseEditorTab(self.state, self)
+        self.tab_pose_editor      = PoseManualEditorTab(self.state, self)
+        self.tab_recon            = ReconstructionTab(self.state, self)
+        self.tab_library          = PoseLibraryTab(self.state, self)
+        self.tab_mesh             = MeshTab(self.state, self)
+        self.tab_export           = ExportTab(self.state, self)
 
-        self.tabs.addTab(self.tab_asset,       "1 · Asset Loader")
-        self.tabs.addTab(self.tab_frm_viewer,  "1b · FRM Viewer")
-        self.tabs.addTab(self.tab_upscaler,    "2 · Upscaler")
-        self.tabs.addTab(self.tab_pose,        "3 · Pose Editor")
-        self.tabs.addTab(self.tab_recon,       "4 · 3D Reconstruction")
-        self.tabs.addTab(self.tab_library,     "5 · Pose Library")
-        self.tabs.addTab(self.tab_mesh,        "6 · Mesh & Normals")
-        self.tabs.addTab(self.tab_export,      "7 · Export")
+        self.tabs.addTab(self.tab_asset,            "1 · Asset Loader")
+        self.tabs.addTab(self.tab_frm_viewer,       "1b · FRM Viewer")
+        self.tabs.addTab(self.tab_upscaler,         "2 · Upscaler")
+        self.tabs.addTab(self.tab_pose,             "3 · Pose Detector")
+        self.tabs.addTab(self.tab_pose_editor,      "4 · Pose Editor")
+        self.tabs.addTab(self.tab_recon,            "5 · 3D Reconstruction")
+        self.tabs.addTab(self.tab_library,          "6 · Pose Library")
+        self.tabs.addTab(self.tab_mesh,             "7 · Mesh & Normals")
+        self.tabs.addTab(self.tab_export,           "8 · Export")
 
         # Central widget is set in _build_console() via a QSplitter
 
@@ -215,7 +218,7 @@ class MainWindow(QMainWindow):
         act_tri = QAction("Triangulate", self)
         act_tri.setShortcut("Ctrl+T")
         act_tri.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(4),
+            self.tabs.setCurrentIndex(5),
             self.tab_recon.run_triangulation(),
         ))
         tb.addAction(act_tri)
@@ -223,7 +226,7 @@ class MainWindow(QMainWindow):
         act_exp = QAction("Export GLB…", self)
         act_exp.setShortcut("Ctrl+E")
         act_exp.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(7),
+            self.tabs.setCurrentIndex(8),
             self.tab_export.export_glb(),
         ))
         tb.addAction(act_exp)
@@ -233,7 +236,8 @@ class MainWindow(QMainWindow):
             "Load critter sprites (.npy / .png / .frm)",
             "Preview and verify FRM frame registration",
             "Upscale frames with Real-ESRGAN",
-            "Inspect and correct 2D pose landmarks",
+            "Run MediaPipe pose detection",
+            "Manually drag and correct 2D pose landmarks",
             "Run 3D triangulation and inspect skeleton",
             "Average poses across multiple characters",
             "Fit mesh template and bake normal maps",
