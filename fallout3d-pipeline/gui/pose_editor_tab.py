@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QFrame, QGraphicsView, QGraphicsScene,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsItem,
     QSlider, QSplitter, QProgressBar, QCheckBox, QGroupBox,
+    QComboBox, QDoubleSpinBox,
 )
 from PyQt6.QtGui import QPixmap, QImage, QPen, QBrush, QColor, QPainter, QKeyEvent
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QPointF, QRectF
@@ -227,10 +228,13 @@ class DetectionWorker(QObject):
     finished = pyqtSignal()
     error    = pyqtSignal(str)
 
-    def __init__(self, char, bidirectional: bool = False):
+    def __init__(self, char, bidirectional: bool = False,
+                 weight_mode: str = "visibility", threshold: float = 0.3):
         super().__init__()
         self.char          = char
         self.bidirectional = bidirectional
+        self.weight_mode   = weight_mode
+        self.threshold     = threshold
 
     def run(self):
         try:
@@ -245,7 +249,7 @@ class DetectionWorker(QObject):
             import os, urllib.request
             from pipeline.pose_triangulator import (
                 _MODEL_PATH, _MODEL_URL, _MODEL_DIR,
-                POSE_CONNECTIONS as _PC, _normalized_to_pixel,
+                POSE_CONNECTIONS as _PC, _normalized_to_pixel, _landmark_conf,
             )
             if not os.path.exists(_MODEL_PATH):
                 os.makedirs(_MODEL_DIR, exist_ok=True)
@@ -315,11 +319,12 @@ class DetectionWorker(QObject):
                         img_ann = img_rgb.copy()
 
                         if result.pose_landmarks:
-                            lms_raw = result.pose_landmarks[0]
-                            lm_arr  = np.array([
-                                [*_normalized_to_pixel(lm.x, lm.y, w, h), lm.z]
-                                for lm in lms_raw
-                            ], dtype=float)
+                            lm_arr = np.zeros((33, 3), dtype=float)
+                            for lm_i, lm in enumerate(result.pose_landmarks[0]):
+                                conf = _landmark_conf(lm, self.weight_mode)
+                                if conf >= self.threshold:
+                                    px, py = _normalized_to_pixel(lm.x, lm.y, w, h)
+                                    lm_arr[lm_i] = [px, py, conf]
                             for s, e in _PC:
                                 if not (np.all(lm_arr[s] == 0) or np.all(lm_arr[e] == 0)):
                                     cv2.line(
@@ -362,9 +367,7 @@ class DetectionWorker(QObject):
             self.char.poses_2d         = poses_out
             self.char.annotated_frames = annotated
 
-            z     = np.abs(poses_out[:, :, :, 2])
-            z_max = z.max() + 1e-6
-            self.char.confidences = (z / z_max).mean(axis=1)  # (N, 33)
+            self.char.confidences = poses_out[:, :, :, 2].mean(axis=1)  # (N, 33)
 
             _logger.info("Pose detection complete.")
             self.finished.emit()
@@ -447,6 +450,24 @@ class PoseEditorTab(QWidget):
         self.heatmap_chk.stateChanged.connect(lambda _: self._refresh_views(self.state.current_frame))
         ctrl.addWidget(self.heatmap_chk)
 
+        ctrl.addWidget(QLabel("Weight by:"))
+        self._weight_combo = QComboBox()
+        self._weight_combo.addItem("visibility",   "visibility")
+        self._weight_combo.addItem("presence",     "presence")
+        self._weight_combo.addItem("vis × pres",   "vis×pres")
+        self._weight_combo.addItem("z depth",      "z")
+        self._weight_combo.setFixedWidth(100)
+        ctrl.addWidget(self._weight_combo)
+
+        ctrl.addWidget(QLabel("Threshold:"))
+        self._thresh_spin = QDoubleSpinBox()
+        self._thresh_spin.setRange(0.0, 1.0)
+        self._thresh_spin.setSingleStep(0.05)
+        self._thresh_spin.setValue(0.3)
+        self._thresh_spin.setDecimals(2)
+        self._thresh_spin.setFixedWidth(64)
+        ctrl.addWidget(self._thresh_spin)
+
         self.btn_apply_all_frames = QPushButton("Apply Correction → All Frames")
         self.btn_apply_all_frames.clicked.connect(self._apply_to_all_frames)
         ctrl.addWidget(self.btn_apply_all_frames)
@@ -515,7 +536,11 @@ class PoseEditorTab(QWidget):
         self.progress.setValue(0)
         self.status_lbl.setText("Running MediaPipe…")
 
-        self._worker = DetectionWorker(char, bidirectional=False)
+        self._worker = DetectionWorker(
+            char, bidirectional=False,
+            weight_mode=self._weight_combo.currentData(),
+            threshold=self._thresh_spin.value(),
+        )
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -561,7 +586,11 @@ class PoseEditorTab(QWidget):
         self.progress.setValue(0)
         self.status_lbl.setText("Running bidirectional detection…")
 
-        self._worker = DetectionWorker(char, bidirectional=True)
+        self._worker = DetectionWorker(
+            char, bidirectional=True,
+            weight_mode=self._weight_combo.currentData(),
+            threshold=self._thresh_spin.value(),
+        )
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

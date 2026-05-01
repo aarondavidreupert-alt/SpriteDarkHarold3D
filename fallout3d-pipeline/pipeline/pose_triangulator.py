@@ -63,6 +63,19 @@ _FLIP_PAIRS = [(11, 12), (13, 14), (15, 16), (23, 24),
                (7, 8), (9, 10), (1, 4), (2, 5), (3, 6)]
 
 
+def _landmark_conf(lm, weight_mode: str) -> float:
+    """Return [0,1] confidence for a MediaPipe NormalizedLandmark."""
+    if weight_mode == "z":
+        return min(1.0, abs(float(lm.z)))
+    v = max(0.0, min(1.0, float(getattr(lm, "visibility", 1.0))))
+    if weight_mode == "visibility":
+        return v
+    p = max(0.0, min(1.0, float(getattr(lm, "presence", v))))
+    if weight_mode == "presence":
+        return p
+    return v * p   # "vis×pres"
+
+
 def _normalized_to_pixel(nx, ny, w, h):
     px = min(math.floor(nx * w), w - 1)
     py = min(math.floor(ny * h), h - 1)
@@ -155,13 +168,19 @@ class PoseTriangulator:
     # Detection
     # ------------------------------------------------------------------
 
-    def detect_poses_sequence(self, progress_cb=None):
+    def detect_poses_sequence(self, progress_cb=None,
+                              weight_mode: str = "visibility",
+                              threshold: float = 0.3):
         """Run MediaPipe on every (frame, perspective) pair.
 
         Parameters
         ----------
         progress_cb : callable(int, int) | None
             Called with (current_frame, total_frames) for progress reporting.
+        weight_mode : str
+            One of "visibility", "presence", "vis×pres", "z".
+        threshold : float
+            Landmarks with confidence below this are zeroed out.
         """
         detector = self._get_detector()
         n_perspectives, n_frames = self.frames.shape[0], self.frames.shape[1]
@@ -190,10 +209,12 @@ class PoseTriangulator:
                 result = detector.detect(mp_image)
 
                 if result.pose_landmarks:
-                    lms = np.array([
-                        [*_normalized_to_pixel(lm.x, lm.y, w, h), lm.z]
-                        for lm in result.pose_landmarks[0]
-                    ], dtype=float)
+                    lms = np.zeros((33, 3), dtype=float)
+                    for lm_i, lm in enumerate(result.pose_landmarks[0]):
+                        conf = _landmark_conf(lm, weight_mode)
+                        if conf >= threshold:
+                            px, py = _normalized_to_pixel(lm.x, lm.y, w, h)
+                            lms[lm_i] = [px, py, conf]
                     lms = self._correct_flip(lms, persp_idx)
                 else:
                     lms = np.zeros((33, 3))
