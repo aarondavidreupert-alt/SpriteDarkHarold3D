@@ -1,20 +1,23 @@
 """
-Tab 3 — 3D Reconstruction
-Triangulates the 2D poses into a 3D skeleton, shows a rotatable
-pyqtgraph OpenGL skeleton viewer, and colour-codes back-projection error.
+Tab 5 — 3D Reconstruction
+Triangulates 2D poses into a 3D skeleton. Layout:
+  LEFT:  rotatable pyqtgraph OpenGL skeleton viewer with Play/Pause animation.
+  RIGHT: 2×3 grid of the 6 direction views showing char.frames with the
+         back-projected 3D skeleton overlaid (blue=left, red=right, white=center).
 """
 
 import sys
 import subprocess
 import logging
 import numpy as np
+import cv2
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QProgressBar, QTableWidget, QTableWidgetItem, QSplitter,
-    QGroupBox, QSlider,
+    QProgressBar, QSplitter, QGroupBox, QSlider, QGridLayout,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject
 
 from gui.main_window import AppState
 from pipeline.pose_triangulator import POSE_CONNECTIONS
@@ -29,9 +32,24 @@ try:
 except ImportError:
     _GL_AVAILABLE = False
 
+_DIR_LABELS = ["NE", "E", "SE", "SW", "W", "NW"]
+
+# Landmark side → RGB draw color (cv2 on RGB array: tuple = (R, G, B))
+_LM_SIDE: dict[int, str] = {}
+for _i in [11, 13, 15, 23, 25, 27, 29, 31, 1, 2, 3, 7, 9]:
+    _LM_SIDE[_i] = "left"
+for _i in [12, 14, 16, 24, 26, 28, 30, 32, 4, 5, 6, 8, 10]:
+    _LM_SIDE[_i] = "right"
+
+_SIDE_COLOR = {
+    "left":   (0,   100, 255),   # blue
+    "right":  (255,  60,   0),   # red
+    "center": (255, 255, 255),   # white
+}
+
 
 # -----------------------------------------------------------------------
-# Skeleton colours
+# 3D viewer colors
 # -----------------------------------------------------------------------
 
 _PART_RGBA = {
@@ -40,24 +58,42 @@ _PART_RGBA = {
     "arms":  (0.2, 0.4, 1.0, 1.0),
     "legs":  (1.0, 1.0, 0.0, 1.0),
 }
-_LM_PART = {**{i: "face" for i in range(11)},
-            **{i: "torso" for i in [11, 12, 23, 24]},
-            **{i: "arms" for i in [13, 14, 15, 16]},
-            **{i: "legs" for i in [25, 26, 27, 28]}}
+_LM_PART = {
+    **{i: "face"  for i in range(11)},
+    **{i: "torso" for i in [11, 12, 23, 24]},
+    **{i: "arms"  for i in [13, 14, 15, 16]},
+    **{i: "legs"  for i in [25, 26, 27, 28]},
+}
 
 
 def _error_color(err: float, max_err: float = 20.0) -> np.ndarray:
-    """Map reprojection error in pixels → RGBA array."""
     t = min(1.0, err / max(max_err, 1e-6))
     return np.array([t, 1.0 - t, 0.0, 1.0])
 
 
+def _arr_to_pixmap(rgb: np.ndarray, max_side: int = 240) -> QPixmap:
+    """RGB (H,W,3) uint8 → QPixmap, downscaled if larger than max_side."""
+    h, w = rgb.shape[:2]
+    if rgb.dtype != np.uint8:
+        rgb = rgb.astype(np.uint8)
+    data = rgb.tobytes()
+    qimg = QImage(data, w, h, w * 3, QImage.Format.Format_RGB888)
+    pix  = QPixmap.fromImage(qimg)
+    if max(h, w) > max_side:
+        pix = pix.scaled(
+            max_side, max_side,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    return pix
+
+
 # -----------------------------------------------------------------------
-# Triangulation worker
+# Workers
 # -----------------------------------------------------------------------
 
 class TriangulationWorker(QObject):
-    finished = pyqtSignal(object)  # np.ndarray (N, 33, 3)
+    finished = pyqtSignal(object)   # np.ndarray (N, 33, 3)
     error    = pyqtSignal(str)
 
     def __init__(self, triangulator, char):
@@ -75,16 +111,8 @@ class TriangulationWorker(QObject):
             self.error.emit(str(exc))
 
 
-# -----------------------------------------------------------------------
-# 3D Viewer (pyqtgraph OpenGL)
-# -----------------------------------------------------------------------
-
-# -----------------------------------------------------------------------
-# Background installer for optional 3D deps
-# -----------------------------------------------------------------------
-
 class _InstallWorker(QObject):
-    finished = pyqtSignal(bool)   # True = success
+    finished = pyqtSignal(bool)
 
     def run(self):
         _logger.info("Installing pyqtgraph and PyOpenGL…")
@@ -113,6 +141,8 @@ class _InstallWorker(QObject):
 
 
 # -----------------------------------------------------------------------
+# 3D Viewer (pyqtgraph OpenGL)
+# -----------------------------------------------------------------------
 
 class SkeletonViewer3D(QWidget):
     def __init__(self, parent=None):
@@ -125,7 +155,6 @@ class SkeletonViewer3D(QWidget):
             self._view.setBackgroundColor("k")
             self._view.setCameraPosition(distance=5, elevation=20, azimuth=45)
 
-            # Grid
             grid = gl.GLGridItem()
             grid.scale(0.5, 0.5, 0.5)
             self._view.addItem(grid)
@@ -168,14 +197,10 @@ class SkeletonViewer3D(QWidget):
             )
 
     def set_skeleton(self, skeleton: np.ndarray, errors: np.ndarray | None = None):
-        """
-        skeleton : (33, 3)
-        errors   : (33,) reprojection error per landmark, or None
-        """
+        """skeleton: (33, 3)  errors: (33,) or None"""
         if not _GL_AVAILABLE:
             return
 
-        # Remove old items
         if self._scatter:
             self._view.removeItem(self._scatter)
             self._scatter = None
@@ -183,7 +208,6 @@ class SkeletonViewer3D(QWidget):
             self._view.removeItem(item)
         self._lines = []
 
-        # Landmark colours
         max_err = errors.max() if errors is not None and errors.max() > 0 else 20.0
         colors = np.zeros((33, 4))
         for i in range(33):
@@ -203,43 +227,15 @@ class SkeletonViewer3D(QWidget):
             )
             self._view.addItem(self._scatter)
 
-        # Bones
         for s, e in POSE_CONNECTIONS:
             if np.all(skeleton[s] == 0) or np.all(skeleton[e] == 0):
                 continue
             pts = np.array([skeleton[s], skeleton[e]], dtype=np.float32)
             part = _LM_PART.get(s, "torso")
-            col = np.array([_PART_RGBA[part]] * 2, dtype=np.float32)
+            col  = np.array([_PART_RGBA[part]] * 2, dtype=np.float32)
             line = gl.GLLinePlotItem(pos=pts, color=col, width=2, antialias=True)
             self._view.addItem(line)
             self._lines.append(line)
-
-
-# -----------------------------------------------------------------------
-# Error table
-# -----------------------------------------------------------------------
-
-class ErrorTable(QTableWidget):
-    def __init__(self, parent=None):
-        super().__init__(0, 3, parent)
-        self.setHorizontalHeaderLabels(["Landmark", "Error (px)", "Quality"])
-        self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.setMaximumWidth(320)
-
-    def set_errors(self, errors: np.ndarray):
-        self.setRowCount(33)
-        for i, err in enumerate(errors):
-            self.setItem(i, 0, QTableWidgetItem(str(i)))
-            self.setItem(i, 1, QTableWidgetItem(f"{err:.2f}"))
-            quality = "Good" if err < 5 else "Fair" if err < 15 else "Poor"
-            qi = QTableWidgetItem(quality)
-            if quality == "Poor":
-                qi.setForeground(Qt.GlobalColor.red)
-            elif quality == "Fair":
-                qi.setForeground(Qt.GlobalColor.yellow)
-            else:
-                qi.setForeground(Qt.GlobalColor.green)
-            self.setItem(i, 2, qi)
 
 
 # -----------------------------------------------------------------------
@@ -251,9 +247,12 @@ class ReconstructionTab(QWidget):
         super().__init__(parent)
         self.state = state
         self._thread: QThread | None = None
+        self._skeleton_sequence: np.ndarray | None = None   # (N, 33, 3)
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
+
         from pipeline import PoseTriangulator
         self._triangulator = PoseTriangulator()
-        self._skeleton_sequence: np.ndarray | None = None  # (N, 33, 3)
 
         if not _GL_AVAILABLE:
             _logger.warning(
@@ -268,12 +267,12 @@ class ReconstructionTab(QWidget):
         self.state.frame_changed.connect(self._on_frame_changed)
         self.state.character_updated.connect(self._on_char_updated)
 
-    # ------------------------------------------------------------------
+    # ── UI ────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        # Top controls
+        # Controls row
         ctrl = QHBoxLayout()
         root.addLayout(ctrl)
 
@@ -296,34 +295,94 @@ class ReconstructionTab(QWidget):
         self.frame_lbl = QLabel("0 / 0")
         ctrl.addWidget(self.frame_lbl)
 
+        self._btn_play = QPushButton("▶ Play")
+        self._btn_play.setCheckable(True)
+        self._btn_play.setFixedWidth(70)
+        self._btn_play.toggled.connect(self._on_play_toggled)
+        ctrl.addWidget(self._btn_play)
+
+        ctrl.addWidget(QLabel("FPS:"))
+        self._speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self._speed_slider.setRange(1, 30)
+        self._speed_slider.setValue(8)
+        self._speed_slider.setFixedWidth(80)
+        self._speed_slider.valueChanged.connect(self._on_fps_changed)
+        ctrl.addWidget(self._speed_slider)
+
+        self._fps_lbl = QLabel("8")
+        self._fps_lbl.setFixedWidth(24)
+        ctrl.addWidget(self._fps_lbl)
+
+        self.mean_err_lbl = QLabel("Mean: —")
+        ctrl.addWidget(self.mean_err_lbl)
+
+        self.max_err_lbl = QLabel("Max: —")
+        ctrl.addWidget(self.max_err_lbl)
+
         self.status_lbl = QLabel("")
         ctrl.addWidget(self.status_lbl)
+        ctrl.addStretch()
 
-        # Splitter: 3D view left, error table right
+        # Main splitter: 3D viewer (left) | back-projection grid (right)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter, 1)
 
         self._viewer = SkeletonViewer3D()
         splitter.addWidget(self._viewer)
 
+        # Right panel: 2-column × 3-row grid of direction views
         right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-
-        stats_box = QGroupBox("Reprojection Error")
-        stats_layout = QVBoxLayout(stats_box)
-        self.mean_err_lbl = QLabel("Mean: —")
-        self.max_err_lbl  = QLabel("Max:  —")
-        stats_layout.addWidget(self.mean_err_lbl)
-        stats_layout.addWidget(self.max_err_lbl)
-        right_layout.addWidget(stats_box)
-
-        self._error_table = ErrorTable()
-        right_layout.addWidget(self._error_table, 1)
+        grid = QGridLayout(right_panel)
+        grid.setSpacing(4)
+        self._bp_labels: list[QLabel] = []
+        for v in range(6):
+            row, col = divmod(v, 2)
+            box = QGroupBox(f"Dir {v + 1} · {_DIR_LABELS[v]}")
+            box_lay = QVBoxLayout(box)
+            box_lay.setContentsMargins(2, 14, 2, 2)
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setMinimumSize(100, 80)
+            lbl.setStyleSheet("background:#111;")
+            box_lay.addWidget(lbl)
+            grid.addWidget(box, row, col)
+            self._bp_labels.append(lbl)
 
         splitter.addWidget(right_panel)
-        splitter.setSizes([800, 320])
+        splitter.setSizes([700, 440])
 
-    # ------------------------------------------------------------------
+    # ── Playback ──────────────────────────────────────────────────────
+
+    def _on_play_toggled(self, playing: bool):
+        if playing:
+            self._btn_play.setText("⏸ Pause")
+            self._play_timer.start(max(1, 1000 // self._speed_slider.value()))
+        else:
+            self._btn_play.setText("▶ Play")
+            self._play_timer.stop()
+
+    def _on_fps_changed(self, fps: int):
+        self._fps_lbl.setText(str(fps))
+        if self._play_timer.isActive():
+            self._play_timer.setInterval(max(1, 1000 // fps))
+
+    def _play_tick(self):
+        char = self.state.current_character
+        if char is None or char.n_frames == 0:
+            self._btn_play.setChecked(False)
+            return
+        n = (
+            self._skeleton_sequence.shape[0]
+            if self._skeleton_sequence is not None
+            else char.n_frames
+        )
+        next_frame = (self.state.current_frame + 1) % n
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setValue(next_frame)
+        self.frame_slider.blockSignals(False)
+        self.state.set_frame(next_frame)
+
+    # ── Triangulation ─────────────────────────────────────────────────
 
     def run_triangulation(self):
         char = self.state.current_character
@@ -331,7 +390,7 @@ class ReconstructionTab(QWidget):
             self.status_lbl.setText("No character loaded.")
             return
         if char.poses_2d is None:
-            self.status_lbl.setText("Run pose detection first (Tab 2).")
+            self.status_lbl.setText("Run pose detection first (Tab 3).")
             return
 
         self.btn_tri.setEnabled(False)
@@ -369,17 +428,17 @@ class ReconstructionTab(QWidget):
         self.btn_tri.setEnabled(True)
         self.status_lbl.setText(f"Error: {msg}")
 
-    # ------------------------------------------------------------------
+    # ── Selection / frame updates ─────────────────────────────────────
 
     def _on_char_changed(self, idx: int):
         char = self.state.current_character
-        if char and char.skeleton_3d is not None:
-            self._skeleton_sequence = char.skeleton_3d
-            n = char.skeleton_3d.shape[0]
-            self.frame_slider.setRange(0, max(0, n - 1))
-            self._show_frame(self.state.current_frame)
-        else:
+        if char is None:
             self._skeleton_sequence = None
+            return
+        n_frames = char.n_frames
+        self.frame_slider.setRange(0, max(0, n_frames - 1))
+        self._skeleton_sequence = char.skeleton_3d   # may be None
+        self._show_frame(min(self.state.current_frame, max(0, n_frames - 1)))
 
     def _on_char_updated(self, idx: int):
         if idx == self.state.selected_idx:
@@ -394,22 +453,81 @@ class ReconstructionTab(QWidget):
     def _on_slider(self, value: int):
         self.state.set_frame(value)
 
+    # ── Frame display ─────────────────────────────────────────────────
+
     def _show_frame(self, frame: int):
-        if self._skeleton_sequence is None:
-            return
-        n = self._skeleton_sequence.shape[0]
-        frame = max(0, min(frame, n - 1))
-        self.frame_lbl.setText(f"{frame + 1} / {n}")
-
-        skeleton = self._skeleton_sequence[frame]
-
-        # Compute reprojection error if poses are available
-        errors = None
         char = self.state.current_character
-        if char and char.poses_2d is not None:
-            errors = self._triangulator.get_backprojection_error(frame, skeleton)
-            self.mean_err_lbl.setText(f"Mean: {errors.mean():.2f} px")
-            self.max_err_lbl.setText(f"Max:  {errors.max():.2f} px")
-            self._error_table.set_errors(errors)
+        if char is None:
+            return
 
-        self._viewer.set_skeleton(skeleton, errors)
+        self.frame_lbl.setText(f"{frame + 1} / {char.n_frames}")
+
+        skeleton = None
+        if self._skeleton_sequence is not None:
+            fi_skel = max(0, min(frame, self._skeleton_sequence.shape[0] - 1))
+            skeleton = self._skeleton_sequence[fi_skel]
+
+            errors = None
+            if char.poses_2d is not None:
+                errors = self._triangulator.get_backprojection_error(fi_skel, skeleton)
+                self.mean_err_lbl.setText(f"Mean: {errors.mean():.2f} px")
+                self.max_err_lbl.setText(f"Max:  {errors.max():.2f} px")
+
+            self._viewer.set_skeleton(skeleton, errors)
+
+        self._refresh_bp_grid(frame, skeleton)
+
+    def _refresh_bp_grid(self, frame: int, skeleton: np.ndarray | None):
+        char = self.state.current_character
+        if char is None:
+            return
+
+        cam_w, cam_h = self._triangulator.camera_setup.image_size
+        bp_views = None
+        if skeleton is not None:
+            bp_views = self._triangulator.camera_setup.back_project_points(skeleton)
+
+        n_dirs = char.frames.shape[0]
+        fi     = max(0, min(frame, char.frames.shape[1] - 1))
+
+        for v in range(min(6, n_dirs)):
+            img = char.frames[v, fi]
+            if img.dtype != np.uint8:
+                img = img.astype(np.uint8)
+            else:
+                img = img.copy()
+
+            if bp_views is not None:
+                img = self._render_backprojection(img, bp_views[v], cam_w, cam_h)
+
+            self._bp_labels[v].setPixmap(_arr_to_pixmap(img))
+
+    @staticmethod
+    def _render_backprojection(
+        img: np.ndarray,
+        bp_pts: np.ndarray,
+        cam_w: int,
+        cam_h: int,
+    ) -> np.ndarray:
+        """Draw back-projected skeleton onto an RGB uint8 image."""
+        out = img.copy()
+        fh, fw = out.shape[:2]
+        sx, sy = fw / cam_w, fh / cam_h
+
+        for s, e in POSE_CONNECTIONS:
+            ps, pe = bp_pts[s], bp_pts[e]
+            if np.all(ps == 0) or np.all(pe == 0):
+                continue
+            x1, y1 = int(ps[0] * sx), int(ps[1] * sy)
+            x2, y2 = int(pe[0] * sx), int(pe[1] * sy)
+            cv2.line(out, (x1, y1), (x2, y2), (180, 180, 180), 1)
+
+        for i, pt in enumerate(bp_pts):
+            if np.all(pt == 0):
+                continue
+            x = max(0, min(int(pt[0] * sx), fw - 1))
+            y = max(0, min(int(pt[1] * sy), fh - 1))
+            color = _SIDE_COLOR.get(_LM_SIDE.get(i, "center"), (255, 255, 255))
+            cv2.circle(out, (x, y), 3, color, -1)
+
+        return out
