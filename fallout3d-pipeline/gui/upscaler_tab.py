@@ -134,6 +134,7 @@ class UpscalerTab(QWidget):
         self._upscaled: np.ndarray | None = None
         self._build_ui()
         self.state.selection_changed.connect(self._on_selection_changed)
+        self.state.character_updated.connect(self._on_selection_changed)
 
     # ── UI ────────────────────────────────────────────────────────────────
 
