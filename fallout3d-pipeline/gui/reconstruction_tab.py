@@ -14,7 +14,7 @@ import cv2
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QProgressBar, QSplitter, QGroupBox, QSlider, QGridLayout,
+    QProgressBar, QScrollArea, QSlider,
 )
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject
@@ -323,33 +323,51 @@ class ReconstructionTab(QWidget):
         ctrl.addWidget(self.status_lbl)
         ctrl.addStretch()
 
-        # Main splitter: 3D viewer (left) | back-projection grid (right)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter, 1)
+        # Views row — same structure as Pose Editor:
+        # Dir 1–3  |  [3D Wireframe]  |  Dir 4–6
+        views_scroll = QScrollArea()
+        views_scroll.setWidgetResizable(True)
+        views_container = QWidget()
+        views_layout = QHBoxLayout(views_container)
+        views_scroll.setWidget(views_container)
+        root.addWidget(views_scroll, 1)
 
-        self._viewer = SkeletonViewer3D()
-        splitter.addWidget(self._viewer)
-
-        # Right panel: 2-column × 3-row grid of direction views
-        right_panel = QWidget()
-        grid = QGridLayout(right_panel)
-        grid.setSpacing(4)
         self._bp_labels: list[QLabel] = []
-        for v in range(6):
-            row, col = divmod(v, 2)
-            box = QGroupBox(f"Dir {v + 1} · {_DIR_LABELS[v]}")
-            box_lay = QVBoxLayout(box)
-            box_lay.setContentsMargins(2, 14, 2, 2)
-            lbl = QLabel()
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setMinimumSize(100, 80)
-            lbl.setStyleSheet("background:#111;")
-            box_lay.addWidget(lbl)
-            grid.addWidget(box, row, col)
-            self._bp_labels.append(lbl)
 
-        splitter.addWidget(right_panel)
-        splitter.setSizes([700, 440])
+        for v in range(3):
+            vbox = QVBoxLayout()
+            dir_lbl = QLabel(f"Dir {v + 1} — {_DIR_LABELS[v]}")
+            dir_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            vbox.addWidget(dir_lbl)
+            img_lbl = QLabel()
+            img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            img_lbl.setMinimumSize(150, 150)
+            img_lbl.setStyleSheet("background:#111;")
+            vbox.addWidget(img_lbl, 1)
+            views_layout.addLayout(vbox, 1)
+            self._bp_labels.append(img_lbl)
+
+        center_vbox = QVBoxLayout()
+        center_title = QLabel("3D Skeleton")
+        center_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        center_vbox.addWidget(center_title)
+        self._viewer = SkeletonViewer3D()
+        self._viewer.setMinimumSize(400, 300)
+        center_vbox.addWidget(self._viewer, 1)
+        views_layout.addLayout(center_vbox, 2)
+
+        for v in range(3, 6):
+            vbox = QVBoxLayout()
+            dir_lbl = QLabel(f"Dir {v + 1} — {_DIR_LABELS[v]}")
+            dir_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            vbox.addWidget(dir_lbl)
+            img_lbl = QLabel()
+            img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            img_lbl.setMinimumSize(150, 150)
+            img_lbl.setStyleSheet("background:#111;")
+            vbox.addWidget(img_lbl, 1)
+            views_layout.addLayout(vbox, 1)
+            self._bp_labels.append(img_lbl)
 
     # ── Playback ──────────────────────────────────────────────────────
 
