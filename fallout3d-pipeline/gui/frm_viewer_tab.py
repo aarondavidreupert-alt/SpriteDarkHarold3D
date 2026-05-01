@@ -5,11 +5,25 @@ upscaling and pose detection.  Shows all 6 directions simultaneously in a
 2×3 grid with playback controls and a per-direction L/R flip tool.
 """
 
+import sys
+import os
 import numpy as np
+
+# ── example_scripts bootstrap (same as asset_loader_tab) ────────────────
+_GUI_DIR   = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_GUI_DIR))
+_SCRIPTS   = os.path.join(_REPO_ROOT, "example_scripts")
+_PAL_PATH  = os.path.join(_REPO_ROOT, "color", "color.pal")
+
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+
+import pal as _pal_mod
+import frmpixels as _frmpixels
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSlider, QGroupBox, QGridLayout, QFrame, QSplitter,
+    QSlider, QGroupBox, QGridLayout, QFrame, QSplitter, QSpinBox,
 )
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -202,6 +216,27 @@ class FrmViewerTab(QWidget):
         flip_l.addWidget(self._btn_flip)
         ll.addWidget(flip_box)
 
+        # Canvas size control
+        canvas_box = QGroupBox("Canvas Size")
+        canvas_l = QVBoxLayout(canvas_box)
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Size:"))
+        self._canvas_spin = QSpinBox()
+        self._canvas_spin.setRange(50, 800)
+        self._canvas_spin.setValue(100)
+        self._canvas_spin.setSingleStep(10)
+        self._canvas_spin.setSuffix(" px")
+        size_row.addWidget(self._canvas_spin, 1)
+        canvas_l.addLayout(size_row)
+        self._btn_apply_canvas = QPushButton("Apply Canvas")
+        self._btn_apply_canvas.setToolTip(
+            "Recomposite FRM frames onto a canvas of the selected size.\n"
+            "Smaller canvas = faster upscaling."
+        )
+        self._btn_apply_canvas.clicked.connect(self._apply_canvas)
+        canvas_l.addWidget(self._btn_apply_canvas)
+        ll.addWidget(canvas_box)
+
         # Status
         self._status_lbl = QLabel("Load a character first.")
         self._status_lbl.setWordWrap(True)
@@ -315,6 +350,82 @@ class FrmViewerTab(QWidget):
         self._status_lbl.setText(
             f"Dir {d + 1} {_DIR_NAMES[d]} flipped horizontally."
         )
+
+    # ------------------------------------------------------------------
+    # Canvas recomposite
+    # ------------------------------------------------------------------
+
+    def _apply_canvas(self):
+        char = self.state.current_character
+        if char is None:
+            self._status_lbl.setText("No character loaded.")
+            return
+        src = char.source_path or ""
+        if not src.lower().endswith(".frm") or not os.path.exists(src):
+            self._status_lbl.setText("Canvas resize only works for .frm files.")
+            return
+
+        canvas_size = self._canvas_spin.value()
+        self._btn_apply_canvas.setEnabled(False)
+        self._status_lbl.setText(f"Recompositing at {canvas_size}×{canvas_size}…")
+
+        try:
+            pal_path = _PAL_PATH if os.path.exists(_PAL_PATH) else None
+            if pal_path is None:
+                self._status_lbl.setText("color.pal not found — cannot recomposite.")
+                self._btn_apply_canvas.setEnabled(True)
+                return
+
+            with open(pal_path, "rb") as f:
+                pal_table = np.array(
+                    [(r, g, b) for r, g, b in _pal_mod.readPAL(f)], dtype=np.uint8
+                )
+
+            with open(src, "rb") as f:
+                info = _frmpixels.readFRMInfo(f, exportImage=True)
+
+            n_dirs   = info['numDirections']
+            n_frames = info['numFrames']
+            offsets  = info['frameOffsets']
+            pixels   = info['framePixels']
+
+            cw = canvas_size
+            ch = canvas_size
+            anchor_x = cw // 2
+            anchor_y = ch * 3 // 4
+
+            new_frames = np.zeros((6, n_frames, ch, cw, 3), dtype=np.uint8)
+
+            for d in range(n_dirs):
+                ox, oy = 0, 0
+                for fi in range(n_frames):
+                    fo = offsets[d][fi]
+                    fw, fh = fo['w'], fo['h']
+                    ox += fo['x']
+                    oy += fo['y']
+
+                    left = anchor_x - (fw // 2 - ox)
+                    top  = anchor_y - (fh - oy)
+
+                    x0 = max(left, 0);  y0 = max(top, 0)
+                    x1 = min(left + fw, cw);  y1 = min(top + fh, ch)
+                    sx0 = x0 - left;  sy0 = y0 - top
+
+                    if x1 > x0 and y1 > y0:
+                        idx = pixels[d][fi].reshape(fh, fw)
+                        new_frames[d, fi, y0:y1, x0:x1] = \
+                            pal_table[idx[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]]
+
+            char.frames = new_frames
+            char.frm_offsets = None
+            self.state.character_updated.emit(self.state.selected_idx)
+            self._status_lbl.setText(
+                f"Recomposited at {canvas_size}×{canvas_size} px."
+            )
+        except Exception as exc:
+            self._status_lbl.setText(f"Error: {exc}")
+        finally:
+            self._btn_apply_canvas.setEnabled(True)
 
     # ------------------------------------------------------------------
     # State signal handlers
