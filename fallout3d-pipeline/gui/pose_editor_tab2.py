@@ -8,7 +8,7 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QScrollArea, QGroupBox, QSplitter, QSlider,
+    QScrollArea, QGroupBox, QSplitter, QSlider, QGridLayout,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeyEvent
@@ -17,10 +17,27 @@ from gui.main_window import AppState
 from gui.pose_editor_tab import ViewCanvas, _DIR_LABELS
 
 _FLIP_PAIRS = [
-    (1, 2), (7, 8),
+    (1, 4), (2, 5), (3, 6), (7, 8), (9, 10),
     (11, 12), (13, 14), (15, 16),
+    (17, 18), (19, 20), (21, 22),
     (23, 24), (25, 26), (27, 28),
     (29, 30), (31, 32),
+]
+
+# (button label, list-of-index-pairs) for the individual swap buttons
+_SWAP_GROUPS = [
+    ("Eyes L/R",  [(1, 4), (2, 5), (3, 6)]),
+    ("Mouth L/R", [(9, 10)]),
+    ("Ears L/R",  [(7, 8)]),
+    ("Shoulders", [(11, 12)]),
+    ("Elbows",    [(13, 14)]),
+    ("Wrists",    [(15, 16)]),
+    ("Fingers",   [(17, 18), (19, 20), (21, 22)]),
+    ("Hips",      [(23, 24)]),
+    ("Knees",     [(25, 26)]),
+    ("Ankles",    [(27, 28)]),
+    ("Heels",     [(29, 30)]),
+    ("Feet",      [(31, 32)]),
 ]
 
 
@@ -126,8 +143,18 @@ class PoseManualEditorTab(QWidget):
         self._editor_canvas.landmark_moved.connect(self._on_editor_lm_moved)
         editor_lay.addWidget(self._editor_canvas, 1)
 
+        # Swap pairs section — 4 columns × 3 rows
+        swap_box = QGroupBox("Swap Pairs")
+        swap_grid = QGridLayout(swap_box)
+        swap_grid.setSpacing(4)
+        for idx, (label, pairs) in enumerate(_SWAP_GROUPS):
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda checked, p=pairs: self._swap_pairs(p))
+            swap_grid.addWidget(btn, idx // 4, idx % 4)
+        editor_lay.addWidget(swap_box)
+
         btn_row = QHBoxLayout()
-        self._btn_flip = QPushButton("Flip Pose L/R")
+        self._btn_flip = QPushButton("Flip All L/R")
         self._btn_flip.clicked.connect(self._flip_pose)
         btn_row.addWidget(self._btn_flip)
 
@@ -265,6 +292,19 @@ class PoseManualEditorTab(QWidget):
         else:
             char.poses_2d[frame, self._selected_dir, lm_idx, :2] = [x, y]
         self._refresh_thumbs(frame)
+
+    def _swap_pairs(self, pairs: list):
+        char = self.state.current_character
+        if char is None or char.poses_2d is None:
+            self._status_lbl.setText("No poses.")
+            return
+        frame = self.state.current_frame
+        pose = char.poses_2d[frame, self._selected_dir]
+        for a, b in pairs:
+            pose[a], pose[b] = pose[b].copy(), pose[a].copy()
+        self._refresh_editor()
+        self._refresh_thumbs(frame)
+        self._status_lbl.setText(f"Swapped {', '.join(f'({a},{b})' for a, b in pairs)}.")
 
     def _flip_pose(self):
         char = self.state.current_character

@@ -44,10 +44,12 @@ POSE_CONNECTIONS = [
     (0, 4), (4, 5), (5, 6), (6, 8),           # face
 ]
 
-LANDMARK_BODY_PART = {**{i: "face" for i in range(11)},
-                      **{i: "torso" for i in [11, 12, 23, 24]},
-                      **{i: "arms" for i in [13, 14, 15, 16]},
-                      **{i: "legs" for i in [25, 26, 27, 28]}}
+LANDMARK_BODY_PART = {
+    **{i: "face"  for i in range(11)},
+    **{i: "torso" for i in [11, 12, 23, 24]},
+    **{i: "arms"  for i in [13, 14, 15, 16, 17, 18, 19, 20, 21, 22]},
+    **{i: "legs"  for i in [25, 26, 27, 28, 29, 30, 31, 32]},
+}
 
 PART_COLORS = {
     "face":  (255, 0, 255),
