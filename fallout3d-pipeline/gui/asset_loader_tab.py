@@ -212,46 +212,52 @@ class ThumbnailGrid(QScrollArea):
 # -----------------------------------------------------------------------
 
 class _DirectionRow(QWidget):
-    """One direction row: canvas-registered frame display + scrubber + flip button."""
+    """One direction row: anchor-composited frame display + scrubber + flip button."""
 
-    DISPLAY_SIZE = 160      # max px for frame thumbnail
+    DISPLAY_SIZE = 160
+    CANVAS_W = 100
+    CANVAS_H = 100
 
     def __init__(self, dir_idx, frame_pixels, frame_offsets, pal_table, parent=None):
         super().__init__(parent)
         self._n = len(frame_pixels)
         self._current_idx = 0
         self._flipped = False
+        self._offsets = frame_offsets
 
-        # 'x'/'y' in frame_offsets are per-frame deltas — accumulate to absolute.
-        abs_x, abs_y = [], []
+        # Accumulate per-frame deltas to get absolute offsets.
+        accumulated = []
         ox = oy = 0
         for fo in frame_offsets:
             ox += fo['x']
             oy += fo['y']
-            abs_x.append(ox)
-            abs_y.append(oy)
+            accumulated.append((ox, oy))
+        self._accumulated = accumulated
 
-        # Normalize so the minimum offset is at (0, 0).
-        min_x = min(abs_x) if abs_x else 0
-        min_y = min(abs_y) if abs_y else 0
-        abs_x = [v - min_x for v in abs_x]
-        abs_y = [v - min_y for v in abs_y]
-        self._abs_x = abs_x
-        self._abs_y = abs_y
+        # Fixed anchor: character feet stay at (anchor_x, anchor_y).
+        anchor_x = self.CANVAS_W // 2
+        anchor_y = self.CANVAS_H // 4 * 3
 
-        # Canvas large enough to hold every frame at its registered position.
-        self._canvas_w = max(abs_x[fi] + frame_offsets[fi]['w'] for fi in range(self._n))
-        self._canvas_h = max(abs_y[fi] + frame_offsets[fi]['h'] for fi in range(self._n))
-
-        # Pre-composite all frames onto RGBA canvases.
+        # Pre-composite all frames onto fixed-size RGBA canvases.
         self._canvases = []
-        for fi in range(self._n):
-            fo = frame_offsets[fi]
-            fw, fh = fo['w'], fo['h']
-            ox_i, oy_i = abs_x[fi], abs_y[fi]
-            canvas = np.zeros((self._canvas_h, self._canvas_w, 4), dtype=np.uint8)
-            indices = frame_pixels[fi].reshape(fh, fw)
-            canvas[oy_i:oy_i+fh, ox_i:ox_i+fw] = _indices_to_rgba(indices, pal_table)
+        for fi, fo in enumerate(frame_offsets):
+            canvas = np.zeros((self.CANVAS_H, self.CANVAS_W, 4), dtype=np.uint8)
+            ox, oy = accumulated[fi]
+            w, h = fo['w'], fo['h']
+            paste_x = anchor_x - (w // 2 - ox)
+            paste_y = anchor_y - (h - oy)
+            indices = frame_pixels[fi].reshape(h, w)
+            rgba = _indices_to_rgba(indices, pal_table)
+            # Clip to canvas bounds before pasting.
+            src_x0 = max(0, -paste_x)
+            src_y0 = max(0, -paste_y)
+            dst_x0 = max(0, paste_x)
+            dst_y0 = max(0, paste_y)
+            copy_w = min(w - src_x0, self.CANVAS_W - dst_x0)
+            copy_h = min(h - src_y0, self.CANVAS_H - dst_y0)
+            if copy_w > 0 and copy_h > 0:
+                canvas[dst_y0:dst_y0+copy_h, dst_x0:dst_x0+copy_w] = \
+                    rgba[src_y0:src_y0+copy_h, src_x0:src_x0+copy_w]
             self._canvases.append(canvas)
 
         # Build UI
@@ -295,7 +301,8 @@ class _DirectionRow(QWidget):
         ctrl.addLayout(scrub)
 
         self._btn_flip = QPushButton("↔ Flip L/R")
-        self._btn_flip.clicked.connect(self._flip)
+        self._btn_flip.setCheckable(True)
+        self._btn_flip.clicked.connect(self._on_flip)
         ctrl.addWidget(self._btn_flip)
 
         lay.addLayout(ctrl)
@@ -318,25 +325,26 @@ class _DirectionRow(QWidget):
         self._spin.blockSignals(False)
         self._show(v)
 
-    def _flip(self):
-        self._flipped = not self._flipped
+    def _on_flip(self, checked):
         self._canvases = [np.fliplr(c) for c in self._canvases]
-        self._btn_flip.setText("↩ Unflip" if self._flipped else "↔ Flip L/R")
+        self._flipped = checked
+        self._btn_flip.setText("↩ Unflip" if checked else "↔ Flip L/R")
         self._show(self._current_idx)
 
     def _show(self, idx):
         self._current_idx = idx
-        pix = _to_pixmap(self._canvases[idx]).scaled(
+        canvas = self._canvases[idx]
+        pix = _to_pixmap(canvas).scaled(
             self.DISPLAY_SIZE, self.DISPLAY_SIZE,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation,
         )
         self._img.setPixmap(pix)
+        ox, oy = self._accumulated[idx]
+        fo = self._offsets[idx]
         self._counter.setText(f"{idx + 1} / {self._n}")
-        ox, oy = self._abs_x[idx], self._abs_y[idx]
         self._info_lbl.setText(
-            f"Canvas: {self._canvas_w}×{self._canvas_h}  |  "
-            f"Frame offset: ({ox}, {oy})"
+            f"Offset: ({ox}, {oy})  Frame: {fo['w']}×{fo['h']}"
         )
 
 
@@ -347,11 +355,10 @@ class FrmViewerPanel(QGroupBox):
         super().__init__("FRM Viewer", parent)
         self._pal_path  = pal_path
         self._pal_table = self._init_palette()
-        self._rows: list[_DirectionRow] = []
-        self._n_frames = 0
+        self._all_rows: list[_DirectionRow] = []
         self._global_frame = 0
-        self._play_timer = QTimer(self)
-        self._play_timer.timeout.connect(self._play_tick)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance_frame)
         self._build_ui()
 
     def _init_palette(self) -> np.ndarray:
@@ -374,30 +381,26 @@ class FrmViewerPanel(QGroupBox):
         top.addWidget(self._info_lbl, 1)
         lay.addLayout(top)
 
-        # Global playback toolbar
-        pb_bar = QHBoxLayout()
-        self._btn_play = QPushButton("▶ Play All")
-        self._btn_play.setCheckable(True)
-        self._btn_play.setFixedWidth(88)
-        self._btn_play.toggled.connect(self._on_play_toggled)
-        pb_bar.addWidget(self._btn_play)
-
-        pb_bar.addWidget(QLabel("Speed:"))
+        # Playback toolbar
+        playbar = QHBoxLayout()
+        btn_play = QPushButton("▶ Play All")
+        btn_play.clicked.connect(lambda: self._timer.start(
+            max(1, 1000 // self._fps_slider.value())))
+        btn_pause = QPushButton("⏸ Pause")
+        btn_pause.clicked.connect(self._timer.stop)
         self._fps_slider = QSlider(Qt.Orientation.Horizontal)
         self._fps_slider.setRange(1, 24)
         self._fps_slider.setValue(8)
-        self._fps_slider.setFixedWidth(110)
-        self._fps_slider.valueChanged.connect(self._on_fps_changed)
-        pb_bar.addWidget(self._fps_slider)
-
         self._fps_lbl = QLabel("8 fps")
-        self._fps_lbl.setFixedWidth(44)
-        pb_bar.addWidget(self._fps_lbl)
-
+        self._fps_slider.valueChanged.connect(
+            lambda v: self._fps_lbl.setText(f"{v} fps"))
         self._sync_lbl = QLabel("Frame — / —")
-        self._sync_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        pb_bar.addWidget(self._sync_lbl, 1)
-        lay.addLayout(pb_bar)
+        for w in [btn_play, btn_pause, QLabel("FPS:"),
+                  self._fps_slider, self._fps_lbl]:
+            playbar.addWidget(w)
+        playbar.addStretch()
+        playbar.addWidget(self._sync_lbl)
+        lay.addLayout(playbar)
 
         # Scrollable area that holds one _DirectionRow per direction
         self._scroll = QScrollArea()
@@ -419,9 +422,7 @@ class FrmViewerPanel(QGroupBox):
             self._load(path)
 
     def _load(self, path: str):
-        self._play_timer.stop()
-        self._btn_play.setChecked(False)
-        self._btn_play.setText("▶ Play All")
+        self._timer.stop()
         try:
             with open(path, "rb") as f:
                 info = _frmpixels.readFRMInfo(f, exportImage=True)
@@ -431,7 +432,6 @@ class FrmViewerPanel(QGroupBox):
 
         n_dirs   = info['numDirections']
         n_frames = info['numFrames']
-        self._n_frames = n_frames
         self._global_frame = 0
         self._info_lbl.setText(
             f"{os.path.basename(path)}  —  "
@@ -445,7 +445,7 @@ class FrmViewerPanel(QGroupBox):
             item = self._rows_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        self._rows = []
+        self._all_rows = []
 
         for d in range(n_dirs):
             row = _DirectionRow(
@@ -456,33 +456,17 @@ class FrmViewerPanel(QGroupBox):
                 self._rows_container,
             )
             self._rows_layout.insertWidget(d, row)
-            self._rows.append(row)
+            self._all_rows.append(row)
 
-    def _on_play_toggled(self, playing: bool):
-        if playing:
-            if self._n_frames == 0:
-                self._btn_play.setChecked(False)
-                return
-            self._btn_play.setText("⏸ Pause")
-            self._play_timer.start(max(1, 1000 // self._fps_slider.value()))
-        else:
-            self._btn_play.setText("▶ Play All")
-            self._play_timer.stop()
-
-    def _on_fps_changed(self, fps: int):
-        self._fps_lbl.setText(f"{fps} fps")
-        if self._play_timer.isActive():
-            self._play_timer.setInterval(max(1, 1000 // fps))
-
-    def _play_tick(self):
-        if self._n_frames == 0 or not self._rows:
-            self._btn_play.setChecked(False)
+    def _advance_frame(self):
+        rows = [r for r in self._all_rows if isinstance(r, _DirectionRow)]
+        if not rows:
             return
-        self._global_frame = (self._global_frame + 1) % self._n_frames
-        fi = self._global_frame
-        for row in self._rows:
-            row._slider.setValue(fi)   # triggers _on_slide → _show
-        self._sync_lbl.setText(f"Frame {fi + 1} / {self._n_frames}")
+        n = rows[0]._n
+        self._global_frame = (self._global_frame + 1) % n
+        for row in rows:
+            row._slider.setValue(self._global_frame % row._n)
+        self._sync_lbl.setText(f"Frame {self._global_frame + 1} / {n}")
 
 
 # -----------------------------------------------------------------------
