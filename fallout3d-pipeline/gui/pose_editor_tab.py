@@ -26,11 +26,11 @@ from pipeline.pose_triangulator import POSE_CONNECTIONS
 _DIR_LABELS = ["NE", "E", "SE", "SW", "W", "NW"]
 
 _LM_SIDE: dict[int, str] = {}
-for _i in [11, 13, 15, 23, 25, 27, 29, 31, 1, 2, 3, 7, 9]:
+for _i in [11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 1, 2, 3, 7, 9]:
     _LM_SIDE[_i] = "left"
-for _i in [12, 14, 16, 24, 26, 28, 30, 32, 4, 5, 6, 8, 10]:
+for _i in [12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 4, 5, 6, 8, 10]:
     _LM_SIDE[_i] = "right"
-for _i in [0] + list(range(17, 23)):
+for _i in [0]:
     _LM_SIDE[_i] = "center"
 
 
@@ -73,11 +73,12 @@ class LandmarkItem(QGraphicsEllipseItem):
         self._on_move = None   # callback(lm_idx, view_idx, x, y)
 
     def set_confidence(self, conf: float):
-        base   = self._SIDE_BASE.get(getattr(self, "side", "center"), QColor(255, 255, 255))
-        factor = int(100 + (1.0 - max(0.0, min(1.0, conf))) * 150)
-        color  = base.darker(factor)
+        conf  = max(0.0, min(1.0, conf))
+        base  = self._SIDE_BASE.get(getattr(self, "side", "center"), QColor(255, 255, 255))
+        alpha = int(40 + conf * 215)   # 40 @ conf=0 → 255 @ conf=1
+        color = QColor(base.red(), base.green(), base.blue(), alpha)
         self.setBrush(QBrush(color))
-        pen = QPen(color.darker(150))
+        pen = QPen(QColor(base.red(), base.green(), base.blue(), min(255, alpha + 40)))
         pen.setWidth(1)
         self.setPen(pen)
 
