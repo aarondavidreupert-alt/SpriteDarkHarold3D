@@ -18,10 +18,20 @@ from PyQt6.QtWidgets import (
     QSlider, QSplitter, QProgressBar, QCheckBox, QGroupBox,
 )
 from PyQt6.QtGui import QPixmap, QImage, QPen, QBrush, QColor, QPainter, QKeyEvent
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QPointF, QRectF
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QPointF, QRectF
 
 from gui.main_window import AppState
 from pipeline.pose_triangulator import POSE_CONNECTIONS
+
+_DIR_LABELS = ["NE", "E", "SE", "SW", "W", "NW"]
+
+_LM_SIDE: dict[int, str] = {}
+for _i in [11, 13, 15, 23, 25, 27, 29, 31, 1, 2, 3, 7, 9]:
+    _LM_SIDE[_i] = "left"
+for _i in [12, 14, 16, 24, 26, 28, 30, 32, 4, 5, 6, 8, 10]:
+    _LM_SIDE[_i] = "right"
+for _i in [0] + list(range(17, 23)):
+    _LM_SIDE[_i] = "center"
 
 
 # -----------------------------------------------------------------------
@@ -42,11 +52,18 @@ def _confidence_color(conf: float) -> QColor:
 
 class LandmarkItem(QGraphicsEllipseItem):
     RADIUS = 5
+    _SIDE_BASE = {
+        "left":   QColor(0, 100, 255),
+        "right":  QColor(255, 60, 60),
+        "center": QColor(255, 255, 255),
+    }
 
-    def __init__(self, lm_idx: int, x: float, y: float, conf: float, view_idx: int):
+    def __init__(self, lm_idx: int, x: float, y: float, conf: float, view_idx: int,
+                 side: str = "center"):
         super().__init__(-self.RADIUS, -self.RADIUS, 2 * self.RADIUS, 2 * self.RADIUS)
-        self.lm_idx = lm_idx
+        self.lm_idx   = lm_idx
         self.view_idx = view_idx
+        self.side     = side  # must be set before set_confidence()
         self.setPos(x, y)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -56,7 +73,9 @@ class LandmarkItem(QGraphicsEllipseItem):
         self._on_move = None   # callback(lm_idx, view_idx, x, y)
 
     def set_confidence(self, conf: float):
-        color = _confidence_color(conf)
+        base   = self._SIDE_BASE.get(getattr(self, "side", "center"), QColor(255, 255, 255))
+        factor = int(100 + (1.0 - max(0.0, min(1.0, conf))) * 150)
+        color  = base.darker(factor)
         self.setBrush(QBrush(color))
         pen = QPen(color.darker(150))
         pen.setWidth(1)
@@ -143,7 +162,8 @@ class ViewCanvas(QGraphicsView):
             if np.all(lm == 0):
                 continue
             conf = float(abs(lm[2])) if len(lm) > 2 else 1.0
-            item = LandmarkItem(i, float(lm[0]), float(lm[1]), conf, self.view_idx)
+            side = _LM_SIDE.get(i, "center")
+            item = LandmarkItem(i, float(lm[0]), float(lm[1]), conf, self.view_idx, side=side)
             item._on_move = self._lm_moved
             self._scene.addItem(item)
             self._lm_items[i] = item
@@ -201,17 +221,15 @@ class ViewCanvas(QGraphicsView):
 # -----------------------------------------------------------------------
 
 class DetectionWorker(QObject):
-    """
-    Runs MediaPipe Holistic (or Pose as fallback) on every view×frame,
-    draws landmarks onto annotated frames, and stores results in CharacterData.
-    """
+    """Runs MediaPipe pose detection on every view×frame using the Tasks API."""
     progress = pyqtSignal(int, int)
     finished = pyqtSignal()
     error    = pyqtSignal(str)
 
-    def __init__(self, char):
+    def __init__(self, char, bidirectional: bool = False):
         super().__init__()
-        self.char = char
+        self.char          = char
+        self.bidirectional = bidirectional
 
     def run(self):
         try:
@@ -220,6 +238,35 @@ class DetectionWorker(QObject):
             msg = "mediapipe not installed — run: pip install mediapipe"
             _logger.error(msg)
             self.error.emit(msg)
+            return
+
+        try:
+            import os, urllib.request
+            from pipeline.pose_triangulator import (
+                _MODEL_PATH, _MODEL_URL, _MODEL_DIR,
+                POSE_CONNECTIONS as _PC, _normalized_to_pixel,
+            )
+            if not os.path.exists(_MODEL_PATH):
+                os.makedirs(_MODEL_DIR, exist_ok=True)
+                _logger.info("Downloading pose model…")
+                urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+
+            from mediapipe.tasks import python as _mptasks
+            from mediapipe.tasks.python import vision as _mpvision
+
+            options = _mpvision.PoseLandmarkerOptions(
+                base_options=_mptasks.BaseOptions(model_asset_path=_MODEL_PATH),
+                running_mode=_mpvision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            detector = _mpvision.PoseLandmarker.create_from_options(options)
+        except Exception as exc:
+            import traceback
+            _logger.error("Failed to create detector: %s\n%s", exc, traceback.format_exc())
+            self.error.emit(str(exc))
             return
 
         try:
@@ -233,79 +280,85 @@ class DetectionWorker(QObject):
             h        = int(frames.shape[2])
             w        = int(frames.shape[3])
 
-            poses_out = np.zeros((n_frames, n_dirs, 33, 3))
-            annotated = np.zeros((n_dirs, n_frames, h, w, 3), dtype=np.uint8)
-
-            # Try Holistic first (face + body + hands); fall back to Pose only
-            try:
-                detector_ctx = mp.solutions.holistic.Holistic(
-                    static_image_mode=True, min_detection_confidence=0.5
-                )
-                mode = "holistic"
-            except AttributeError:
-                detector_ctx = mp.solutions.pose.Pose(
-                    static_image_mode=True, min_detection_confidence=0.5
-                )
-                mode = "pose"
+            total = n_frames * (2 if self.bidirectional else 1)
 
             _logger.info(
-                "Starting detection — %d views × %d frames (%d×%d px) "
-                "using MediaPipe %s",
-                n_dirs, n_frames, w, h, mode,
+                "Starting %s detection — %d views × %d frames (%d×%d px)",
+                "bidirectional" if self.bidirectional else "forward",
+                n_dirs, n_frames, w, h,
             )
 
-            drawing       = mp.solutions.drawing_utils
-            pose_cx       = mp.solutions.pose.POSE_CONNECTIONS
-            lm_spec       = drawing.DrawingSpec(color=(0, 180, 0),   thickness=1, circle_radius=2)
-            conn_spec     = drawing.DrawingSpec(color=(200, 200, 200), thickness=1)
-
-            with detector_ctx as detector:
+            def _run_pass(pass_frames, prog_offset):
+                poses = np.zeros((n_frames, n_dirs, 33, 3))
+                ann   = np.zeros((n_dirs, n_frames, h, w, 3), dtype=np.uint8)
                 for frame_idx in range(n_frames):
                     n_detected = 0
                     for dir_idx in range(n_dirs):
-                        img_rgb = frames[dir_idx, frame_idx]
+                        img_rgb = pass_frames[dir_idx, frame_idx]
                         if img_rgb.dtype != np.uint8:
                             img_rgb = (
                                 (np.clip(img_rgb, 0, 1) * 255).astype(np.uint8)
                                 if img_rgb.max() <= 1.0
                                 else img_rgb.astype(np.uint8)
                             )
+                        if len(img_rgb.shape) == 2:
+                            img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_GRAY2RGB)
+                        elif img_rgb.shape[2] == 4:
+                            img_rgb = img_rgb[:, :, :3]
 
-                        result   = detector.process(img_rgb)
-                        pose_lms = result.pose_landmarks
+                        mp_image = mp.Image(
+                            image_format=mp.ImageFormat.SRGB,
+                            data=np.ascontiguousarray(img_rgb),
+                        )
+                        result = detector.detect(mp_image)
+                        img_ann = img_rgb.copy()
 
-                        # draw_landmarks expects BGR; convert, draw, convert back
-                        img_bgr = img_rgb[..., ::-1].copy()
-                        if pose_lms is not None:
-                            drawing.draw_landmarks(
-                                img_bgr, pose_lms, pose_cx, lm_spec, conn_spec
-                            )
-                            for lm_idx, lm in enumerate(pose_lms.landmark):
-                                px = max(0, min(int(lm.x * w), w - 1))
-                                py = max(0, min(int(lm.y * h), h - 1))
-                                poses_out[frame_idx, dir_idx, lm_idx] = [
-                                    px, py, lm.visibility
-                                ]
-                                _logger.debug(
-                                    "F%d D%d LM%02d: (%d,%d) vis=%.2f",
-                                    frame_idx, dir_idx, lm_idx, px, py, lm.visibility,
-                                )
+                        if result.pose_landmarks:
+                            lms_raw = result.pose_landmarks[0]
+                            lm_arr  = np.array([
+                                [*_normalized_to_pixel(lm.x, lm.y, w, h), lm.z]
+                                for lm in lms_raw
+                            ], dtype=float)
+                            for s, e in _PC:
+                                if not (np.all(lm_arr[s] == 0) or np.all(lm_arr[e] == 0)):
+                                    cv2.line(
+                                        img_ann,
+                                        (int(lm_arr[s, 0]), int(lm_arr[s, 1])),
+                                        (int(lm_arr[e, 0]), int(lm_arr[e, 1])),
+                                        (200, 200, 200), 1,
+                                    )
+                            for lm_i, pt in enumerate(lm_arr):
+                                if not np.all(pt == 0):
+                                    cv2.circle(img_ann, (int(pt[0]), int(pt[1])), 3, (0, 180, 0), -1)
+                            poses[frame_idx, dir_idx] = lm_arr
                             n_detected += 1
                         else:
-                            _logger.warning(
-                                "No pose detected — frame=%d dir=%d",
-                                frame_idx, dir_idx,
-                            )
+                            _logger.warning("No pose — frame=%d dir=%d", frame_idx, dir_idx)
 
-                        annotated[dir_idx, frame_idx] = img_bgr[..., ::-1]
+                        ann[dir_idx, frame_idx] = img_ann
 
-                    _logger.info(
-                        "Frame %d/%d — pose in %d/%d views",
-                        frame_idx + 1, n_frames, n_detected, n_dirs,
-                    )
-                    self.progress.emit(frame_idx + 1, n_frames)
+                    _logger.info("Frame %d/%d — pose in %d/%d views",
+                                 frame_idx + 1, n_frames, n_detected, n_dirs)
+                    self.progress.emit(prog_offset + frame_idx + 1, total)
+                return poses, ann
 
-            self.char.poses_2d        = poses_out
+            if self.bidirectional:
+                fwd, fwd_ann = _run_pass(frames, 0)
+                bwd_rev, _   = _run_pass(frames[:, ::-1], n_frames)
+                bwd          = bwd_rev[::-1]
+                fwd_zero     = np.all(fwd == 0, axis=-1, keepdims=True)
+                bwd_zero     = np.all(bwd == 0, axis=-1, keepdims=True)
+                poses_out    = np.where(
+                    ~fwd_zero & ~bwd_zero, (fwd + bwd) / 2,
+                    np.where(~fwd_zero, fwd, bwd),
+                )
+                annotated = fwd_ann
+            else:
+                poses_out, annotated = _run_pass(frames, 0)
+
+            detector.close()
+
+            self.char.poses_2d         = poses_out
             self.char.annotated_frames = annotated
 
             z     = np.abs(poses_out[:, :, :, 2])
@@ -331,6 +384,8 @@ class PoseEditorTab(QWidget):
         super().__init__(parent)
         self.state = state
         self._thread: QThread | None = None
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
         self._build_ui()
 
         self.state.selection_changed.connect(self._on_char_changed)
@@ -350,6 +405,11 @@ class PoseEditorTab(QWidget):
         self.btn_detect.clicked.connect(self.run_detection)
         ctrl.addWidget(self.btn_detect)
 
+        self.btn_bidir = QPushButton("Run Bidirectional Detection")
+        self.btn_bidir.setStyleSheet("padding: 5px 12px;")
+        self.btn_bidir.clicked.connect(self.run_bidirectional_detection)
+        ctrl.addWidget(self.btn_bidir)
+
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setVisible(False)
@@ -363,6 +423,24 @@ class PoseEditorTab(QWidget):
 
         self.frame_lbl = QLabel("0 / 0")
         ctrl.addWidget(self.frame_lbl)
+
+        self.btn_play = QPushButton("▶ Play")
+        self.btn_play.setCheckable(True)
+        self.btn_play.setFixedWidth(70)
+        self.btn_play.toggled.connect(self._on_play_toggled)
+        ctrl.addWidget(self.btn_play)
+
+        ctrl.addWidget(QLabel("FPS:"))
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(1, 30)
+        self.speed_slider.setValue(8)
+        self.speed_slider.setFixedWidth(80)
+        self.speed_slider.valueChanged.connect(self._on_fps_changed)
+        ctrl.addWidget(self.speed_slider)
+
+        self.fps_lbl = QLabel("8")
+        self.fps_lbl.setFixedWidth(24)
+        ctrl.addWidget(self.fps_lbl)
 
         self.heatmap_chk = QCheckBox("Confidence Heatmap")
         self.heatmap_chk.stateChanged.connect(lambda _: self._refresh_views(self.state.current_frame))
@@ -390,7 +468,7 @@ class PoseEditorTab(QWidget):
         self._canvases: list[ViewCanvas] = []
         for v in range(6):
             vbox = QVBoxLayout()
-            lbl = QLabel(f"Dir {v+1}  ({v*60}°)")
+            lbl = QLabel(f"Dir {v+1} — {_DIR_LABELS[v]}")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             vbox.addWidget(lbl)
             canvas = ViewCanvas(v)
@@ -428,12 +506,15 @@ class PoseEditorTab(QWidget):
             self.status_lbl.setText("No character loaded.")
             return
 
+        self._play_timer.stop()
+        self.btn_play.setChecked(False)
         self.btn_detect.setEnabled(False)
+        self.btn_bidir.setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.status_lbl.setText("Running MediaPipe…")
 
-        self._worker = DetectionWorker(char)
+        self._worker = DetectionWorker(char, bidirectional=False)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -450,6 +531,7 @@ class PoseEditorTab(QWidget):
         self._thread.quit()
         self.progress.setVisible(False)
         self.btn_detect.setEnabled(True)
+        self.btn_bidir.setEnabled(True)
         self.status_lbl.setText("Detection complete.")
         char = self.state.current_character
         if char:
@@ -461,7 +543,55 @@ class PoseEditorTab(QWidget):
         self._thread.quit()
         self.progress.setVisible(False)
         self.btn_detect.setEnabled(True)
+        self.btn_bidir.setEnabled(True)
         self.status_lbl.setText(f"Error: {msg}")
+
+    def run_bidirectional_detection(self):
+        char = self.state.current_character
+        if char is None:
+            self.status_lbl.setText("No character loaded.")
+            return
+
+        self._play_timer.stop()
+        self.btn_play.setChecked(False)
+        self.btn_detect.setEnabled(False)
+        self.btn_bidir.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.status_lbl.setText("Running bidirectional detection…")
+
+        self._worker = DetectionWorker(char, bidirectional=True)
+        self._thread = QThread(self)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_detect_progress)
+        self._worker.finished.connect(self._on_detect_done)
+        self._worker.error.connect(self._on_detect_error)
+        self._thread.start()
+
+    def _on_play_toggled(self, playing: bool):
+        if playing:
+            self.btn_play.setText("⏸ Pause")
+            self._play_timer.start(max(1, 1000 // self.speed_slider.value()))
+        else:
+            self.btn_play.setText("▶ Play")
+            self._play_timer.stop()
+
+    def _on_fps_changed(self, fps: int):
+        self.fps_lbl.setText(str(fps))
+        if self._play_timer.isActive():
+            self._play_timer.setInterval(max(1, 1000 // fps))
+
+    def _play_tick(self):
+        char = self.state.current_character
+        if char is None or char.n_frames == 0:
+            self.btn_play.setChecked(False)
+            return
+        next_frame = (self.state.current_frame + 1) % char.n_frames
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setValue(next_frame)
+        self.frame_slider.blockSignals(False)
+        self.state.set_frame(next_frame)
 
     # ------------------------------------------------------------------
     # View refresh
