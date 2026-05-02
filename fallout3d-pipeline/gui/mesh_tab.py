@@ -89,8 +89,10 @@ class MeshViewer3D(QWidget):
             grid.scale(0.5, 0.5, 0.5)
             self._view.addItem(grid)
             self._mesh_item = None
+            self._skeleton_item = None
             layout.addWidget(self._view)
         else:
+            self._skeleton_item = None
             layout.addWidget(QLabel("pyqtgraph not available."))
 
     def set_mesh(self, verts: np.ndarray, faces: np.ndarray, weights: np.ndarray | None = None, bone_idx: int = 0):
@@ -123,6 +125,37 @@ class MeshViewer3D(QWidget):
             smooth=True,
         )
         self._view.addItem(self._mesh_item)
+
+    def set_skeleton_overlay(self, joints: np.ndarray, connections: list):
+        """Draw the skeleton as yellow line segments on top of the mesh."""
+        if not _GL_AVAILABLE:
+            return
+        if self._skeleton_item is not None:
+            self._view.removeItem(self._skeleton_item)
+            self._skeleton_item = None
+
+        if joints is None or len(joints) == 0 or not connections:
+            return
+
+        n = len(joints)
+        seg_pts = []
+        for pair in connections:
+            i, j = int(pair[0]), int(pair[1])
+            if 0 <= i < n and 0 <= j < n:
+                seg_pts.append(joints[i])
+                seg_pts.append(joints[j])
+        if not seg_pts:
+            return
+
+        pts = np.asarray(seg_pts, dtype=np.float32)
+        self._skeleton_item = gl.GLLinePlotItem(
+            pos=pts,
+            color=(1.0, 1.0, 0.0, 0.8),
+            width=2,
+            mode="lines",
+            antialias=True,
+        )
+        self._view.addItem(self._skeleton_item)
 
 
 # -----------------------------------------------------------------------

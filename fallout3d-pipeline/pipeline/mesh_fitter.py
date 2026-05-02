@@ -47,6 +47,9 @@ ANCHORS_BY_CATEGORY = {
     "amorphous": _HUMANOID_ANCHORS,
 }
 
+# Public alias for callers that need direct access to the humanoid anchor map
+HUMANOID_ANCHORS = _HUMANOID_ANCHORS
+
 # Per-anchor bone parent names — drives rotation computation in LBS.
 # None means root joint (identity rotation, translation only).
 _HUMANOID_BONE_PARENTS: Dict[str, Optional[str]] = {
@@ -264,6 +267,154 @@ def fit_mesh_to_skeleton(
 
 
 # ------------------------------------------------------------------
+# Procedural primitive geometry (capsules / spheres for ragdoll meshes)
+# ------------------------------------------------------------------
+
+def _make_sphere(
+    center: np.ndarray,
+    radius: float,
+    segments: int = 8,
+    rings: int = 8,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (verts, faces) for a UV sphere centred at `center`."""
+    center = np.asarray(center, dtype=float)
+    verts: List[List[float]] = []
+    faces: List[List[int]] = []
+
+    south_idx = len(verts)
+    verts.append((center + np.array([0.0, 0.0, -radius])).tolist())
+
+    ring_starts: List[int] = []
+    for i in range(1, rings):
+        a = np.pi * i / rings           # 0 = south pole, π = north pole
+        z_off = -np.cos(a) * radius
+        rr    = np.sin(a) * radius
+        ring_starts.append(len(verts))
+        for s in range(segments):
+            theta = 2.0 * np.pi * s / segments
+            v = center + np.array([rr * np.cos(theta), rr * np.sin(theta), z_off])
+            verts.append(v.tolist())
+
+    north_idx = len(verts)
+    verts.append((center + np.array([0.0, 0.0, radius])).tolist())
+
+    if ring_starts:
+        first = ring_starts[0]
+        for s in range(segments):
+            a = first + s
+            b = first + (s + 1) % segments
+            faces.append([south_idx, b, a])
+
+        for r in range(len(ring_starts) - 1):
+            ra, rb = ring_starts[r], ring_starts[r + 1]
+            for s in range(segments):
+                s2 = (s + 1) % segments
+                faces.append([ra + s,  ra + s2, rb + s2])
+                faces.append([ra + s,  rb + s2, rb + s ])
+
+        last = ring_starts[-1]
+        for s in range(segments):
+            a = last + s
+            b = last + (s + 1) % segments
+            faces.append([north_idx, a, b])
+
+    return (np.array(verts, dtype=np.float32),
+            np.array(faces, dtype=np.int32))
+
+
+def _make_capsule(
+    p0: np.ndarray,
+    p1: np.ndarray,
+    radius: float,
+    segments: int = 8,
+    rings: int = 4,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (verts, faces) for a capsule whose cylindrical body runs from p0 to p1.
+
+    The capsule is built as: bottom hemisphere (around p0) + cylinder body
+    + top hemisphere (around p1). All ring vertices are placed in a local
+    frame (tan, bit) orthogonal to the axis.
+    """
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    axis = p1 - p0
+    L = float(np.linalg.norm(axis))
+    if L < 1e-9:
+        return _make_sphere((p0 + p1) * 0.5, radius,
+                            segments=segments, rings=max(4, rings * 2))
+
+    axis_unit = axis / L
+    # Pick a helper that's not parallel to axis to build the local frame
+    helper = np.array([0.0, 0.0, 1.0]) if abs(axis_unit[2]) < 0.9 \
+             else np.array([1.0, 0.0, 0.0])
+    tan = np.cross(axis_unit, helper)
+    tan /= (np.linalg.norm(tan) + 1e-12)
+    bit = np.cross(axis_unit, tan)
+
+    # Build list of (ring_center_3d, ring_radius) pairs from south pole to north
+    rings_data: List[Tuple[np.ndarray, float]] = []
+
+    # Bottom hemisphere: angle a from 0 (pole) to π/2 (equator at p0)
+    for i in range(1, rings + 1):
+        a = (np.pi / 2.0) * (i / rings)
+        cen = p0 - axis_unit * radius * np.cos(a)
+        rr  = radius * np.sin(a)
+        rings_data.append((cen, rr))
+
+    # Cylinder ends at p1 equator (the p0 equator was already added above)
+    rings_data.append((p1, radius))
+
+    # Top hemisphere: angle a from just past π/2 down toward 0 (north pole)
+    for i in range(1, rings):
+        a = (np.pi / 2.0) * (1.0 - i / rings)
+        cen = p1 + axis_unit * radius * np.cos(a)
+        rr  = radius * np.sin(a)
+        rings_data.append((cen, rr))
+
+    verts: List[List[float]] = []
+    faces: List[List[int]] = []
+
+    south_idx = len(verts)
+    verts.append((p0 - axis_unit * radius).tolist())
+
+    ring_starts: List[int] = []
+    for cen, rr in rings_data:
+        ring_starts.append(len(verts))
+        for s in range(segments):
+            theta = 2.0 * np.pi * s / segments
+            v = cen + rr * (np.cos(theta) * tan + np.sin(theta) * bit)
+            verts.append(v.tolist())
+
+    north_idx = len(verts)
+    verts.append((p1 + axis_unit * radius).tolist())
+
+    # South-pole fan
+    first = ring_starts[0]
+    for s in range(segments):
+        a = first + s
+        b = first + (s + 1) % segments
+        faces.append([south_idx, b, a])
+
+    # Ring-to-ring quads
+    for r in range(len(ring_starts) - 1):
+        ra, rb = ring_starts[r], ring_starts[r + 1]
+        for s in range(segments):
+            s2 = (s + 1) % segments
+            faces.append([ra + s,  ra + s2, rb + s2])
+            faces.append([ra + s,  rb + s2, rb + s ])
+
+    # North-pole fan
+    last = ring_starts[-1]
+    for s in range(segments):
+        a = last + s
+        b = last + (s + 1) % segments
+        faces.append([north_idx, a, b])
+
+    return (np.array(verts, dtype=np.float32),
+            np.array(faces, dtype=np.int32))
+
+
+# ------------------------------------------------------------------
 # MeshFitter class
 # ------------------------------------------------------------------
 
@@ -347,3 +498,77 @@ class MeshFitter:
         if self.skinning_weights is None:
             return np.array([])
         return self.skinning_weights[:, bone_idx]
+
+    # ------------------------------------------------------------------
+    # Ragdoll mesh generation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def generate_ragdoll(
+        skeleton: np.ndarray,
+        capsule_segments: int = 8,
+        capsule_rings: int = 4,
+        radius_scale: float = 0.045,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Build a capsule-based ragdoll mesh from a MediaPipe skeleton (33, 3).
+
+        Generates a sphere for the head and a capsule for each bone,
+        sized relative to the body height.
+        """
+        sk = np.asarray(skeleton, dtype=float)
+        if sk.shape[0] < 29:
+            raise ValueError(
+                f"generate_ragdoll expects ≥29 MediaPipe joints, got {sk.shape[0]}"
+            )
+
+        feet_mid = (sk[27] + sk[28]) * 0.5
+        body_height = float(np.linalg.norm(sk[0] - feet_mid))
+        if body_height < 1e-6:
+            body_height = 1.0
+        radius = body_height * float(radius_scale)
+
+        shoulders_mid = (sk[11] + sk[12]) * 0.5
+        hips_mid      = (sk[23] + sk[24]) * 0.5
+
+        bones: List[Tuple[np.ndarray, np.ndarray]] = [
+            (sk[0],         shoulders_mid),  # neck
+            (sk[11],        sk[13]),         # L upper arm
+            (sk[12],        sk[14]),         # R upper arm
+            (sk[13],        sk[15]),         # L forearm
+            (sk[14],        sk[16]),         # R forearm
+            (shoulders_mid, hips_mid),       # torso
+            (sk[23],        sk[25]),         # L thigh
+            (sk[24],        sk[26]),         # R thigh
+            (sk[25],        sk[27]),         # L shin
+            (sk[26],        sk[28]),         # R shin
+        ]
+
+        all_verts: List[np.ndarray] = []
+        all_faces: List[np.ndarray] = []
+        offset = 0
+
+        # Head (sphere at landmark 0, slightly larger than capsule radius)
+        hv, hf = _make_sphere(
+            sk[0], radius * 1.8,
+            segments=capsule_segments,
+            rings=max(4, capsule_segments),
+        )
+        all_verts.append(hv)
+        all_faces.append(hf + offset)
+        offset += len(hv)
+
+        for p0, p1 in bones:
+            cv, cf = _make_capsule(
+                p0, p1, radius,
+                segments=capsule_segments,
+                rings=capsule_rings,
+            )
+            all_verts.append(cv)
+            all_faces.append(cf + offset)
+            offset += len(cv)
+
+        return (
+            np.concatenate(all_verts, axis=0).astype(np.float32),
+            np.concatenate(all_faces, axis=0).astype(np.int32),
+        )

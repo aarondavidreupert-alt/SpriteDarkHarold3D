@@ -11,14 +11,16 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QSlider, QGroupBox, QSplitter, QProgressBar,
-    QSpinBox, QDoubleSpinBox, QCheckBox, QSizePolicy,
+    QSpinBox, QDoubleSpinBox, QCheckBox, QSizePolicy, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor
 
 from gui.main_window import AppState, CRITTER_CATEGORIES
 from gui.mesh_tab import MeshFitWorker, MeshViewer3D
-from pipeline.mesh_fitter import MeshFitter, ANCHORS_BY_CATEGORY
+from pipeline.mesh_fitter import (
+    MeshFitter, ANCHORS_BY_CATEGORY, HUMANOID_ANCHORS, compute_skinning_weights,
+)
 from pipeline.isometric_camera_setup5 import IsometricCameraSetup
 from pipeline.ao_baker import AmbientOcclusionBaker
 from pipeline.shadow_sprite import ShadowSpriteGenerator
@@ -186,8 +188,6 @@ class MeshBuilderTab(QWidget):
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(360)
-        panel.setMaximumWidth(440)
         vbox = QVBoxLayout(panel)
         vbox.setContentsMargins(4, 4, 4, 4)
 
@@ -204,15 +204,27 @@ class MeshBuilderTab(QWidget):
         # ── Step 2: Fit Mesh
         grp2 = QGroupBox("Step 2: Fit Mesh")
         v2 = QVBoxLayout(grp2)
+
+        row_mt = QHBoxLayout()
+        row_mt.addWidget(QLabel("Mesh type:"))
+        self.mesh_type_combo = QComboBox()
+        self.mesh_type_combo.addItem("Ragdoll (capsules)", "ragdoll")
+        self.mesh_type_combo.addItem("Template OBJ",       "template")
+        self.mesh_type_combo.currentIndexChanged.connect(self._on_mesh_type_changed)
+        row_mt.addWidget(self.mesh_type_combo, 1)
+        v2.addLayout(row_mt)
+
         row_t = QHBoxLayout()
-        row_t.addWidget(QLabel("Template:"))
+        self.template_label = QLabel("Template:")
+        row_t.addWidget(self.template_label)
         self.template_combo = QComboBox()
         self._refresh_template_combo()
         row_t.addWidget(self.template_combo, 1)
         v2.addLayout(row_t)
 
         row_f = QHBoxLayout()
-        row_f.addWidget(QLabel("Falloff:"))
+        self.falloff_label = QLabel("Falloff:")
+        row_f.addWidget(self.falloff_label)
         self.falloff_spin = QDoubleSpinBox()
         self.falloff_spin.setRange(1.0, 10.0)
         self.falloff_spin.setSingleStep(0.5)
@@ -386,7 +398,17 @@ class MeshBuilderTab(QWidget):
         vbox.addWidget(self.status_lbl)
 
         vbox.addStretch()
-        return panel
+
+        # Apply initial mesh-type enabled state (default = ragdoll)
+        self._on_mesh_type_changed(self.mesh_type_combo.currentIndex())
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(panel)
+        scroll.setMinimumWidth(360)
+        scroll.setMaximumWidth(440)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return scroll
 
     def _build_right_panel(self) -> QWidget:
         panel = QSplitter(Qt.Orientation.Vertical)
@@ -431,6 +453,13 @@ class MeshBuilderTab(QWidget):
         self.status_lbl.setText(text)
         _logger.info("MeshBuilder: %s", text)
 
+    def _on_mesh_type_changed(self, _idx: int):
+        is_ragdoll = self.mesh_type_combo.currentData() == "ragdoll"
+        for w in (self.template_label, self.template_combo,
+                  self.falloff_label, self.falloff_spin):
+            w.setEnabled(not is_ragdoll)
+        self._set_status("")
+
     def _animation_skeleton(self) -> np.ndarray | None:
         """Return per-frame (33,3) skeleton frames from char (preferring SkeletonBuilder)."""
         char = self.state.current_character
@@ -474,6 +503,33 @@ class MeshBuilderTab(QWidget):
             self._set_status("No skeleton — run triangulation first.")
             return
 
+        rest = skel[0]
+        mesh_type = self.mesh_type_combo.currentData()
+
+        if mesh_type == "ragdoll":
+            # Build a capsule ragdoll directly — fast enough to skip the worker
+            self._fitter = MeshFitter(char.category)
+            try:
+                verts, faces = MeshFitter.generate_ragdoll(rest)
+            except Exception as exc:
+                self._set_status(f"Ragdoll generation error: {exc}")
+                return
+
+            self._fitter.template_verts = verts
+            self._fitter.template_faces = faces
+            self._fitter.anchors = HUMANOID_ANCHORS
+            try:
+                # Use the standard bind path so rest_joints + bone_parents are set
+                # and per-frame fit_to_skeleton(...) works correctly.
+                self._fitter.bind_to_skeleton(rest, falloff=self.falloff_spin.value())
+            except Exception as exc:
+                self._set_status(f"Ragdoll skinning error: {exc}")
+                return
+
+            self._on_fit_done(verts, faces, self._fitter.skinning_weights)
+            return
+
+        # Template OBJ path (existing behaviour)
         tmpl_path = self.template_combo.currentData()
         if not tmpl_path or not os.path.exists(tmpl_path):
             self._set_status("No valid template selected.")
@@ -486,7 +542,6 @@ class MeshBuilderTab(QWidget):
             self._set_status(f"Template load error: {exc}")
             return
 
-        rest = skel[0]
         self.fit_progress.setVisible(True)
         self.btn_fit.setEnabled(False)
 
@@ -499,7 +554,8 @@ class MeshBuilderTab(QWidget):
         self._fit_thread.start()
 
     def _on_fit_done(self, verts, faces, weights):
-        self._fit_thread.quit()
+        if self._fit_thread is not None:
+            self._fit_thread.quit()
         self.fit_progress.setVisible(False)
         self.btn_fit.setEnabled(True)
 
@@ -603,6 +659,11 @@ class MeshBuilderTab(QWidget):
             self._mesh_verts, self._mesh_faces,
             weights, self.bone_slider.value(),
         )
+
+        skel = self._animation_skeleton()
+        if skel is not None and skel.shape[0] > 0:
+            f = max(0, min(self._current_frame, skel.shape[0] - 1))
+            self._mesh_viewer.set_skeleton_overlay(skel[f], POSE_CONNECTIONS)
 
     # ------------------------------------------------------------------
     # Step 5: Projection
