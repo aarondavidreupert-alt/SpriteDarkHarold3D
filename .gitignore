@@ -3,3 +3,4 @@ __pycache__/
 *.pyo
 *.npy
 /fallout3d-pipeline/gui/__pycache__
+/fallout3d-pipeline/gui/__pycache__
