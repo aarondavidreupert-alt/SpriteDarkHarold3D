@@ -147,6 +147,7 @@ class MainWindow(QMainWindow):
         from gui.skeleton_tab import SkeletonTab
         from gui.pose_library_tab import PoseLibraryTab
         from gui.mesh_tab import MeshTab
+        from gui.mesh_builder_tab import MeshBuilderTab
         from gui.export_tab import ExportTab
 
         self.tabs = QTabWidget()
@@ -162,6 +163,7 @@ class MainWindow(QMainWindow):
         self.tab_skeleton         = SkeletonTab(self.state, self)
         self.tab_library          = PoseLibraryTab(self.state, self)
         self.tab_mesh             = MeshTab(self.state, self)
+        self.tab_mesh_builder     = MeshBuilderTab(self.state, self)
         self.tab_export           = ExportTab(self.state, self)
 
         self.tabs.addTab(self.tab_asset,            "1 · Asset Loader")
@@ -173,6 +175,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_skeleton,         "5b · Skeleton")
         self.tabs.addTab(self.tab_library,          "6 · Pose Library")
         self.tabs.addTab(self.tab_mesh,             "7 · Mesh & Normals")
+        self.tabs.addTab(self.tab_mesh_builder,     "7b · Mesh Builder")
         self.tabs.addTab(self.tab_export,           "8 · Export")
 
         # Auto-build skeleton after triangulation completes
@@ -263,6 +266,7 @@ class MainWindow(QMainWindow):
             "View rigid skeleton, bone lengths, and frame interpolation",
             "Average poses across multiple characters",
             "Fit mesh template and bake normal maps",
+            "Fit mesh to skeleton, animate, project onto sprite views",
             "Export glTF / GLB and animation data",
         ]
         if 0 <= idx < len(labels):
