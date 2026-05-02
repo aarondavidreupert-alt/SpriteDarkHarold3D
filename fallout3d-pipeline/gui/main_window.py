@@ -50,6 +50,7 @@ class CharacterData:
     source_path: Optional[str] = None               # original file path for cache naming
     frm_offsets: Optional[list] = None              # [dir][frame] (ox, oy) int tuples — FRM only
     color: Tuple[float, float, float] = (1.0, 0.8, 0.2)
+    skeleton: Optional[object] = None               # SkeletonBuilder instance
 
     @property
     def n_frames(self) -> int:
@@ -143,6 +144,7 @@ class MainWindow(QMainWindow):
         from gui.pose_editor_tab import PoseEditorTab
         from gui.pose_editor_tab2 import PoseManualEditorTab
         from gui.reconstruction_tab import ReconstructionTab
+        from gui.skeleton_tab import SkeletonTab
         from gui.pose_library_tab import PoseLibraryTab
         from gui.mesh_tab import MeshTab
         from gui.export_tab import ExportTab
@@ -157,6 +159,7 @@ class MainWindow(QMainWindow):
         self.tab_pose             = PoseEditorTab(self.state, self)
         self.tab_pose_editor      = PoseManualEditorTab(self.state, self)
         self.tab_recon            = ReconstructionTab(self.state, self)
+        self.tab_skeleton         = SkeletonTab(self.state, self)
         self.tab_library          = PoseLibraryTab(self.state, self)
         self.tab_mesh             = MeshTab(self.state, self)
         self.tab_export           = ExportTab(self.state, self)
@@ -167,9 +170,13 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_pose,             "3 · Pose Detector")
         self.tabs.addTab(self.tab_pose_editor,      "4 · Pose Editor")
         self.tabs.addTab(self.tab_recon,            "5 · 3D Reconstruction")
+        self.tabs.addTab(self.tab_skeleton,         "5b · Skeleton")
         self.tabs.addTab(self.tab_library,          "6 · Pose Library")
         self.tabs.addTab(self.tab_mesh,             "7 · Mesh & Normals")
         self.tabs.addTab(self.tab_export,           "8 · Export")
+
+        # Auto-build skeleton after triangulation completes
+        self.state.character_updated.connect(self._auto_build_skeleton)
 
         # Central widget is set in _build_console() via a QSplitter
 
@@ -231,6 +238,20 @@ class MainWindow(QMainWindow):
         ))
         tb.addAction(act_exp)
 
+    def _auto_build_skeleton(self, idx: int):
+        """After triangulation, auto-run SkeletonBuilder with mode='median'."""
+        from pipeline.skeleton_builder import SkeletonBuilder
+        char = self.state.characters[idx] if 0 <= idx < len(self.state.characters) else None
+        if char is None or char.skeleton_3d is None or char.skeleton is not None:
+            return
+        try:
+            sb = SkeletonBuilder()
+            sb.build(char.skeleton_3d, mode="median")
+            char.skeleton = sb
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Auto skeleton build failed: %s", exc)
+
     def _on_tab_changed(self, idx: int):
         labels = [
             "Load critter sprites (.npy / .png / .frm)",
@@ -239,6 +260,7 @@ class MainWindow(QMainWindow):
             "Run MediaPipe pose detection",
             "Manually drag and correct 2D pose landmarks",
             "Run 3D triangulation and inspect skeleton",
+            "View rigid skeleton, bone lengths, and frame interpolation",
             "Average poses across multiple characters",
             "Fit mesh template and bake normal maps",
             "Export glTF / GLB and animation data",
