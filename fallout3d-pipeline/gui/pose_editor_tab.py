@@ -4,20 +4,53 @@ Runs MediaPipe detection in background, then displays all 6 views with
 draggable landmarks overlaid in a confidence heatmap.
 """
 
+import logging as _logging_mod
+
 import numpy as np
 import cv2
+
+_logger = _logging_mod.getLogger(__name__)
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QScrollArea, QFrame, QGraphicsView, QGraphicsScene,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsItem,
     QSlider, QSplitter, QProgressBar, QCheckBox, QGroupBox,
+    QDoubleSpinBox, QRadioButton, QButtonGroup,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from PyQt6.QtGui import QPixmap, QImage, QPen, QBrush, QColor, QPainter, QKeyEvent
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QPointF, QRectF
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QPointF, QRectF
 
 from gui.main_window import AppState
 from pipeline.pose_triangulator import POSE_CONNECTIONS
+
+_DIR_LABELS = ["NE", "E", "SE", "SW", "W", "NW"]
+
+_LM_SIDE: dict[int, str] = {}
+for _i in [11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 1, 2, 3, 7, 9]:
+    _LM_SIDE[_i] = "left"
+for _i in [12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 4, 5, 6, 8, 10]:
+    _LM_SIDE[_i] = "right"
+for _i in [0]:
+    _LM_SIDE[_i] = "center"
+
+_LM_NAMES = [
+    "Nose", "L-Eye-Inner", "L-Eye", "L-Eye-Outer",
+    "R-Eye-Inner", "R-Eye", "R-Eye-Outer", "L-Ear", "R-Ear",
+    "L-Mouth", "R-Mouth", "L-Shoulder", "R-Shoulder",
+    "L-Elbow", "R-Elbow", "L-Wrist", "R-Wrist",
+    "L-Pinky", "R-Pinky", "L-Index", "R-Index",
+    "L-Thumb", "R-Thumb", "L-Hip", "R-Hip",
+    "L-Knee", "R-Knee", "L-Ankle", "R-Ankle",
+    "L-Heel", "R-Heel", "L-Foot", "R-Foot",
+]
+
+_LM_ROW_COLOR = {
+    "left":   QColor(180, 210, 255),
+    "right":  QColor(255, 195, 195),
+    "center": QColor(240, 240, 240),
+}
 
 
 # -----------------------------------------------------------------------
@@ -38,11 +71,18 @@ def _confidence_color(conf: float) -> QColor:
 
 class LandmarkItem(QGraphicsEllipseItem):
     RADIUS = 5
+    _SIDE_BASE = {
+        "left":   QColor(0, 100, 255),
+        "right":  QColor(255, 60, 60),
+        "center": QColor(255, 255, 255),
+    }
 
-    def __init__(self, lm_idx: int, x: float, y: float, conf: float, view_idx: int):
+    def __init__(self, lm_idx: int, x: float, y: float, conf: float, view_idx: int,
+                 side: str = "center"):
         super().__init__(-self.RADIUS, -self.RADIUS, 2 * self.RADIUS, 2 * self.RADIUS)
-        self.lm_idx = lm_idx
+        self.lm_idx   = lm_idx
         self.view_idx = view_idx
+        self.side     = side  # must be set before set_confidence()
         self.setPos(x, y)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -52,9 +92,12 @@ class LandmarkItem(QGraphicsEllipseItem):
         self._on_move = None   # callback(lm_idx, view_idx, x, y)
 
     def set_confidence(self, conf: float):
-        color = _confidence_color(conf)
+        conf  = max(0.0, min(1.0, conf))
+        base  = self._SIDE_BASE.get(getattr(self, "side", "center"), QColor(255, 255, 255))
+        alpha = int(40 + conf * 215)   # 40 @ conf=0 → 255 @ conf=1
+        color = QColor(base.red(), base.green(), base.blue(), alpha)
         self.setBrush(QBrush(color))
-        pen = QPen(color.darker(150))
+        pen = QPen(QColor(base.red(), base.green(), base.blue(), min(255, alpha + 40)))
         pen.setWidth(1)
         self.setPen(pen)
 
@@ -80,6 +123,7 @@ class LandmarkItem(QGraphicsEllipseItem):
 
 class ViewCanvas(QGraphicsView):
     landmark_moved = pyqtSignal(int, int, float, float)  # lm_idx, view_idx, x, y
+    canvas_clicked = pyqtSignal(int)                     # view_idx
 
     def __init__(self, view_idx: int, parent=None):
         super().__init__(parent)
@@ -94,6 +138,11 @@ class ViewCanvas(QGraphicsView):
         self._show_heatmap = False
 
         self._scene.mousePressEvent = self._scene_mouse_press
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.canvas_clicked.emit(self.view_idx)
 
     def set_frame(self, img: np.ndarray, pose: np.ndarray | None, show_heatmap: bool = False):
         """
@@ -139,7 +188,8 @@ class ViewCanvas(QGraphicsView):
             if np.all(lm == 0):
                 continue
             conf = float(abs(lm[2])) if len(lm) > 2 else 1.0
-            item = LandmarkItem(i, float(lm[0]), float(lm[1]), conf, self.view_idx)
+            side = _LM_SIDE.get(i, "center")
+            item = LandmarkItem(i, float(lm[0]), float(lm[1]), conf, self.view_idx, side=side)
             item._on_move = self._lm_moved
             self._scene.addItem(item)
             self._lm_items[i] = item
@@ -197,29 +247,159 @@ class ViewCanvas(QGraphicsView):
 # -----------------------------------------------------------------------
 
 class DetectionWorker(QObject):
+    """Runs MediaPipe pose detection on every view×frame using the Tasks API."""
     progress = pyqtSignal(int, int)
     finished = pyqtSignal()
     error    = pyqtSignal(str)
 
-    def __init__(self, triangulator, char):
+    def __init__(self, char, bidirectional: bool = False,
+                 weight_mode: str = "vis×pres", threshold: float = 0.3):
         super().__init__()
-        self.triangulator = triangulator
-        self.char = char
+        self.char          = char
+        self.bidirectional = bidirectional
+        self.weight_mode   = weight_mode
+        self.threshold     = threshold
 
     def run(self):
         try:
-            self.triangulator.load_animation_sequence(self.char.frames)
-            self.triangulator.detect_poses_sequence(
-                progress_cb=lambda f, t: self.progress.emit(f, t)
+            import mediapipe as mp
+        except ImportError:
+            msg = "mediapipe not installed — run: pip install mediapipe"
+            _logger.error(msg)
+            self.error.emit(msg)
+            return
+
+        try:
+            import os, urllib.request
+            from pipeline.pose_triangulator import (
+                _MODEL_PATH, _MODEL_URL, _MODEL_DIR,
+                POSE_CONNECTIONS as _PC, _normalized_to_pixel, _landmark_conf,
             )
-            self.char.poses_2d = self.triangulator.poses_sequence
-            # Build simple confidence map from z
-            if self.char.poses_2d is not None:
-                z = np.abs(self.char.poses_2d[:, :, :, 2])
-                z_max = z.max() + 1e-6
-                self.char.confidences = (z / z_max).mean(axis=1)  # (N, 33)
-            self.finished.emit()
+            if not os.path.exists(_MODEL_PATH):
+                os.makedirs(_MODEL_DIR, exist_ok=True)
+                _logger.info("Downloading pose model…")
+                urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+
+            from mediapipe.tasks import python as _mptasks
+            from mediapipe.tasks.python import vision as _mpvision
+
+            options = _mpvision.PoseLandmarkerOptions(
+                base_options=_mptasks.BaseOptions(model_asset_path=_MODEL_PATH),
+                running_mode=_mpvision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            detector = _mpvision.PoseLandmarker.create_from_options(options)
         except Exception as exc:
+            import traceback
+            _logger.error("Failed to create detector: %s\n%s", exc, traceback.format_exc())
+            self.error.emit(str(exc))
+            return
+
+        try:
+            frames = (
+                self.char.upscaled_frames
+                if self.char.upscaled_frames is not None
+                else self.char.frames
+            )
+            n_dirs   = int(frames.shape[0])
+            n_frames = int(frames.shape[1])
+            h        = int(frames.shape[2])
+            w        = int(frames.shape[3])
+
+            total = n_frames * (2 if self.bidirectional else 1)
+
+            _logger.info(
+                "Starting %s detection — %d views × %d frames (%d×%d px)",
+                "bidirectional" if self.bidirectional else "forward",
+                n_dirs, n_frames, w, h,
+            )
+
+            def _run_pass(pass_frames, prog_offset):
+                poses = np.zeros((n_frames, n_dirs, 33, 3))
+                ann   = np.zeros((n_dirs, n_frames, h, w, 3), dtype=np.uint8)
+                for frame_idx in range(n_frames):
+                    n_detected = 0
+                    for dir_idx in range(n_dirs):
+                        img_rgb = pass_frames[dir_idx, frame_idx]
+                        if img_rgb.dtype != np.uint8:
+                            img_rgb = (
+                                (np.clip(img_rgb, 0, 1) * 255).astype(np.uint8)
+                                if img_rgb.max() <= 1.0
+                                else img_rgb.astype(np.uint8)
+                            )
+                        if len(img_rgb.shape) == 2:
+                            img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_GRAY2RGB)
+                        elif img_rgb.shape[2] == 4:
+                            img_rgb = img_rgb[:, :, :3]
+
+                        mp_image = mp.Image(
+                            image_format=mp.ImageFormat.SRGB,
+                            data=np.ascontiguousarray(img_rgb),
+                        )
+                        result = detector.detect(mp_image)
+                        img_ann = img_rgb.copy()
+
+                        if result.pose_landmarks:
+                            lm_arr = np.zeros((33, 3), dtype=float)
+                            for lm_i, lm in enumerate(result.pose_landmarks[0]):
+                                conf = _landmark_conf(lm, self.weight_mode)
+                                if conf >= self.threshold:
+                                    px, py = _normalized_to_pixel(lm.x, lm.y, w, h)
+                                    lm_arr[lm_i] = [px, py, conf]
+                            for s, e in _PC:
+                                if not (np.all(lm_arr[s] == 0) or np.all(lm_arr[e] == 0)):
+                                    cv2.line(
+                                        img_ann,
+                                        (int(lm_arr[s, 0]), int(lm_arr[s, 1])),
+                                        (int(lm_arr[e, 0]), int(lm_arr[e, 1])),
+                                        (200, 200, 200), 1,
+                                    )
+                            for lm_i, pt in enumerate(lm_arr):
+                                if not np.all(pt == 0):
+                                    cv2.circle(img_ann, (int(pt[0]), int(pt[1])), 3, (0, 180, 0), -1)
+                            poses[frame_idx, dir_idx] = lm_arr
+                            n_detected += 1
+                        else:
+                            _logger.warning("No pose — frame=%d dir=%d", frame_idx, dir_idx)
+
+                        ann[dir_idx, frame_idx] = img_ann
+
+                    _logger.info("Frame %d/%d — pose in %d/%d views",
+                                 frame_idx + 1, n_frames, n_detected, n_dirs)
+                    self.progress.emit(prog_offset + frame_idx + 1, total)
+                return poses, ann
+
+            if self.bidirectional:
+                fwd, fwd_ann = _run_pass(frames, 0)
+                bwd_rev, _   = _run_pass(frames[:, ::-1], n_frames)
+                bwd          = bwd_rev[::-1]
+                fwd_zero     = np.all(fwd == 0, axis=-1, keepdims=True)
+                bwd_zero     = np.all(bwd == 0, axis=-1, keepdims=True)
+                poses_out    = np.where(
+                    ~fwd_zero & ~bwd_zero, (fwd + bwd) / 2,
+                    np.where(~fwd_zero, fwd, bwd),
+                )
+                annotated = fwd_ann
+            else:
+                poses_out, annotated = _run_pass(frames, 0)
+
+            detector.close()
+
+            self.char.poses_2d         = poses_out
+            self.char.annotated_frames = annotated
+
+            self.char.confidences = poses_out[:, :, :, 2].mean(axis=1)  # (N, 33)
+
+            _logger.info("Pose detection complete.")
+            self.finished.emit()
+
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            _logger.error("Detection failed: %s\n%s", exc, tb)
             self.error.emit(str(exc))
 
 
@@ -232,8 +412,9 @@ class PoseEditorTab(QWidget):
         super().__init__(parent)
         self.state = state
         self._thread: QThread | None = None
-        from pipeline import PoseTriangulator
-        self._triangulator = PoseTriangulator()
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
+        self._selected_view: int = 0
         self._build_ui()
 
         self.state.selection_changed.connect(self._on_char_changed)
@@ -253,6 +434,11 @@ class PoseEditorTab(QWidget):
         self.btn_detect.clicked.connect(self.run_detection)
         ctrl.addWidget(self.btn_detect)
 
+        self.btn_bidir = QPushButton("Run Bidirectional Detection")
+        self.btn_bidir.setStyleSheet("padding: 5px 12px;")
+        self.btn_bidir.clicked.connect(self.run_bidirectional_detection)
+        ctrl.addWidget(self.btn_bidir)
+
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setVisible(False)
@@ -267,9 +453,51 @@ class PoseEditorTab(QWidget):
         self.frame_lbl = QLabel("0 / 0")
         ctrl.addWidget(self.frame_lbl)
 
+        self.btn_play = QPushButton("▶ Play")
+        self.btn_play.setCheckable(True)
+        self.btn_play.setFixedWidth(70)
+        self.btn_play.toggled.connect(self._on_play_toggled)
+        ctrl.addWidget(self.btn_play)
+
+        ctrl.addWidget(QLabel("FPS:"))
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(1, 30)
+        self.speed_slider.setValue(8)
+        self.speed_slider.setFixedWidth(80)
+        self.speed_slider.valueChanged.connect(self._on_fps_changed)
+        ctrl.addWidget(self.speed_slider)
+
+        self.fps_lbl = QLabel("8")
+        self.fps_lbl.setFixedWidth(24)
+        ctrl.addWidget(self.fps_lbl)
+
         self.heatmap_chk = QCheckBox("Confidence Heatmap")
         self.heatmap_chk.stateChanged.connect(lambda _: self._refresh_views(self.state.current_frame))
         ctrl.addWidget(self.heatmap_chk)
+
+        # Confidence group box with radio buttons
+        conf_box = QGroupBox("Confidence")
+        conf_box_lay = QHBoxLayout(conf_box)
+        conf_box_lay.setContentsMargins(6, 2, 6, 2)
+        conf_box_lay.setSpacing(6)
+        self._conf_btn_group = QButtonGroup(self)
+        for label, mode in [("z", "z"), ("visibility", "visibility"),
+                             ("presence", "presence"), ("vis×pres", "vis×pres")]:
+            rb = QRadioButton(label)
+            rb.setProperty("conf_mode", mode)
+            self._conf_btn_group.addButton(rb)
+            conf_box_lay.addWidget(rb)
+            if mode == "vis×pres":
+                rb.setChecked(True)
+        conf_box_lay.addWidget(QLabel("Min:"))
+        self._thresh_spin = QDoubleSpinBox()
+        self._thresh_spin.setRange(0.0, 1.0)
+        self._thresh_spin.setSingleStep(0.05)
+        self._thresh_spin.setValue(0.3)
+        self._thresh_spin.setDecimals(2)
+        self._thresh_spin.setFixedWidth(60)
+        conf_box_lay.addWidget(self._thresh_spin)
+        ctrl.addWidget(conf_box)
 
         self.btn_apply_all_frames = QPushButton("Apply Correction → All Frames")
         self.btn_apply_all_frames.clicked.connect(self._apply_to_all_frames)
@@ -282,25 +510,63 @@ class PoseEditorTab(QWidget):
         self.status_lbl = QLabel("")
         ctrl.addWidget(self.status_lbl)
 
-        # 6-view grid
+        # Main content: 6-view grid (left) + landmark weight table (right, hidden)
+        content_split = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(content_split, 1)
+
         views_scroll = QScrollArea()
         views_scroll.setWidgetResizable(True)
         views_container = QWidget()
         views_layout = QHBoxLayout(views_container)
         views_scroll.setWidget(views_container)
-        root.addWidget(views_scroll, 1)
+        content_split.addWidget(views_scroll)
 
         self._canvases: list[ViewCanvas] = []
         for v in range(6):
             vbox = QVBoxLayout()
-            lbl = QLabel(f"Dir {v+1}  ({v*60}°)")
+            lbl = QLabel(f"Dir {v+1} — {_DIR_LABELS[v]}")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             vbox.addWidget(lbl)
             canvas = ViewCanvas(v)
             canvas.landmark_moved.connect(self._on_landmark_moved)
+            canvas.canvas_clicked.connect(self._on_canvas_selected)
             vbox.addWidget(canvas)
             views_layout.addLayout(vbox)
             self._canvases.append(canvas)
+
+        # Landmark weight table panel
+        self._lm_panel = QWidget()
+        self._lm_panel.setMinimumWidth(220)
+        lm_panel_lay = QVBoxLayout(self._lm_panel)
+        lm_panel_lay.setContentsMargins(4, 4, 4, 4)
+        lm_panel_lay.setSpacing(4)
+
+        self._lm_panel_title = QLabel("Direction 1 — NE")
+        self._lm_panel_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lm_panel_lay.addWidget(self._lm_panel_title)
+
+        self._lm_table = QTableWidget(33, 3)
+        self._lm_table.setHorizontalHeaderLabels(["Landmark", "Side", "Confidence"])
+        hh = self._lm_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._lm_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._lm_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        lm_panel_lay.addWidget(self._lm_table)
+
+        content_split.addWidget(self._lm_panel)
+        content_split.setSizes([800, 260])
+
+    # ------------------------------------------------------------------
+    # Confidence weight mode
+    # ------------------------------------------------------------------
+
+    def _get_weight_mode(self) -> str:
+        for btn in self._conf_btn_group.buttons():
+            if btn.isChecked():
+                return btn.property("conf_mode")
+        return "vis×pres"
 
     # ------------------------------------------------------------------
     # Key navigation
@@ -331,12 +597,19 @@ class PoseEditorTab(QWidget):
             self.status_lbl.setText("No character loaded.")
             return
 
+        self._play_timer.stop()
+        self.btn_play.setChecked(False)
         self.btn_detect.setEnabled(False)
+        self.btn_bidir.setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.status_lbl.setText("Running MediaPipe…")
 
-        self._worker = DetectionWorker(self._triangulator, char)
+        self._worker = DetectionWorker(
+            char, bidirectional=False,
+            weight_mode=self._get_weight_mode(),
+            threshold=self._thresh_spin.value(),
+        )
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -353,6 +626,7 @@ class PoseEditorTab(QWidget):
         self._thread.quit()
         self.progress.setVisible(False)
         self.btn_detect.setEnabled(True)
+        self.btn_bidir.setEnabled(True)
         self.status_lbl.setText("Detection complete.")
         char = self.state.current_character
         if char:
@@ -364,7 +638,59 @@ class PoseEditorTab(QWidget):
         self._thread.quit()
         self.progress.setVisible(False)
         self.btn_detect.setEnabled(True)
+        self.btn_bidir.setEnabled(True)
         self.status_lbl.setText(f"Error: {msg}")
+
+    def run_bidirectional_detection(self):
+        char = self.state.current_character
+        if char is None:
+            self.status_lbl.setText("No character loaded.")
+            return
+
+        self._play_timer.stop()
+        self.btn_play.setChecked(False)
+        self.btn_detect.setEnabled(False)
+        self.btn_bidir.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.status_lbl.setText("Running bidirectional detection…")
+
+        self._worker = DetectionWorker(
+            char, bidirectional=True,
+            weight_mode=self._get_weight_mode(),
+            threshold=self._thresh_spin.value(),
+        )
+        self._thread = QThread(self)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_detect_progress)
+        self._worker.finished.connect(self._on_detect_done)
+        self._worker.error.connect(self._on_detect_error)
+        self._thread.start()
+
+    def _on_play_toggled(self, playing: bool):
+        if playing:
+            self.btn_play.setText("⏸ Pause")
+            self._play_timer.start(max(1, 1000 // self.speed_slider.value()))
+        else:
+            self.btn_play.setText("▶ Play")
+            self._play_timer.stop()
+
+    def _on_fps_changed(self, fps: int):
+        self.fps_lbl.setText(str(fps))
+        if self._play_timer.isActive():
+            self._play_timer.setInterval(max(1, 1000 // fps))
+
+    def _play_tick(self):
+        char = self.state.current_character
+        if char is None or char.n_frames == 0:
+            self.btn_play.setChecked(False)
+            return
+        next_frame = (self.state.current_frame + 1) % char.n_frames
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setValue(next_frame)
+        self.frame_slider.blockSignals(False)
+        self.state.set_frame(next_frame)
 
     # ------------------------------------------------------------------
     # View refresh
@@ -374,6 +700,8 @@ class PoseEditorTab(QWidget):
         char = self.state.current_character
         if char is None:
             return
+        self._selected_view = 0
+        self._lm_panel_title.setText(f"Direction 1 — {_DIR_LABELS[0]}")
         self.frame_slider.setRange(0, max(0, char.n_frames - 1))
         self.frame_slider.setValue(0)
         self._refresh_views(0)
@@ -389,12 +717,23 @@ class PoseEditorTab(QWidget):
         n = char.n_frames
         self.frame_lbl.setText(f"{frame_idx + 1} / {n}")
 
+        ann = char.annotated_frames    # (6, N, H, W, 3) or None
+        usc = char.upscaled_frames     # (6, N, H, W, 3) or None
+
         for v in range(min(6, char.frames.shape[0])):
-            img = char.frames[v, frame_idx]
+            fi = min(frame_idx, char.frames.shape[1] - 1)
+            if ann is not None and v < ann.shape[0] and fi < ann.shape[1]:
+                img = ann[v, fi]
+            elif usc is not None and v < usc.shape[0] and fi < usc.shape[1]:
+                img = usc[v, fi]
+            else:
+                img = char.frames[v, fi]
             pose = None
             if char.poses_2d is not None:
                 pose = char.poses_2d[frame_idx, v]
             self._canvases[v].set_frame(img, pose, show_heatmap)
+
+        self._populate_lm_table()
 
     # ------------------------------------------------------------------
     # Landmark editing
@@ -435,3 +774,48 @@ class PoseEditorTab(QWidget):
                     n = min(other.n_frames, char.n_frames)
                     other.poses_2d[:n] = char.poses_2d[:n]
         self.status_lbl.setText("Correction applied to all matching characters.")
+
+    # ------------------------------------------------------------------
+    # Landmark weight table
+    # ------------------------------------------------------------------
+
+    def _on_canvas_selected(self, view_idx: int):
+        self._selected_view = view_idx
+        self._lm_panel_title.setText(
+            f"Direction {view_idx + 1} — {_DIR_LABELS[view_idx]}"
+        )
+        self._populate_lm_table()
+
+    def _populate_lm_table(self):
+        char = self.state.current_character
+        frame = self.state.current_frame
+        view  = self._selected_view
+
+        self._lm_table.blockSignals(True)
+        for lm_idx in range(33):
+            name = f"{lm_idx}  {_LM_NAMES[lm_idx]}"
+            side = _LM_SIDE.get(lm_idx, "center")
+            bg   = _LM_ROW_COLOR.get(side, _LM_ROW_COLOR["center"])
+
+            conf = 0.0
+            if (char is not None and char.poses_2d is not None
+                    and frame < char.poses_2d.shape[0]):
+                conf = float(char.poses_2d[frame, view, lm_idx, 2])
+
+            name_item = QTableWidgetItem(name)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            name_item.setBackground(QBrush(bg))
+
+            side_item = QTableWidgetItem(side)
+            side_item.setFlags(side_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            side_item.setBackground(QBrush(bg))
+
+            conf_item = QTableWidgetItem(f"{conf:.3f}")
+            conf_item.setFlags(conf_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            conf_item.setBackground(QBrush(bg))
+
+            self._lm_table.setItem(lm_idx, 0, name_item)
+            self._lm_table.setItem(lm_idx, 1, side_item)
+            self._lm_table.setItem(lm_idx, 2, conf_item)
+
+        self._lm_table.blockSignals(False)

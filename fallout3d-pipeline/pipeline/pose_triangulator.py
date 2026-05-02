@@ -3,6 +3,7 @@ PoseTriangulator — MediaPipe pose detection across 6 isometric views,
 with flip correction, per-landmark confidence weighting, and triangulation.
 """
 
+import os
 import math
 import numpy as np
 import cv2
@@ -17,6 +18,21 @@ except ImportError:
     _MP_AVAILABLE = False
 
 # -----------------------------------------------------------------------
+# Model paths (Tasks API)
+# -----------------------------------------------------------------------
+
+_PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT    = os.path.dirname(os.path.dirname(_PIPELINE_DIR))
+_MODEL_DIR    = os.path.join(_REPO_ROOT, "models")
+_MODEL_PATH   = os.path.join(_MODEL_DIR, "pose_landmarker_heavy.task")
+_MODEL_URL    = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "pose_landmarker/pose_landmarker_heavy/float16/latest/"
+    "pose_landmarker_heavy.task"
+)
+
+
+# -----------------------------------------------------------------------
 # Skeleton connectivity
 # -----------------------------------------------------------------------
 
@@ -28,10 +44,12 @@ POSE_CONNECTIONS = [
     (0, 4), (4, 5), (5, 6), (6, 8),           # face
 ]
 
-LANDMARK_BODY_PART = {**{i: "face" for i in range(11)},
-                      **{i: "torso" for i in [11, 12, 23, 24]},
-                      **{i: "arms" for i in [13, 14, 15, 16]},
-                      **{i: "legs" for i in [25, 26, 27, 28]}}
+LANDMARK_BODY_PART = {
+    **{i: "face"  for i in range(11)},
+    **{i: "torso" for i in [11, 12, 23, 24]},
+    **{i: "arms"  for i in [13, 14, 15, 16, 17, 18, 19, 20, 21, 22]},
+    **{i: "legs"  for i in [25, 26, 27, 28, 29, 30, 31, 32]},
+}
 
 PART_COLORS = {
     "face":  (255, 0, 255),
@@ -43,6 +61,19 @@ PART_COLORS = {
 # Pairs that get swapped on a left/right flip
 _FLIP_PAIRS = [(11, 12), (13, 14), (15, 16), (23, 24),
                (7, 8), (9, 10), (1, 4), (2, 5), (3, 6)]
+
+
+def _landmark_conf(lm, weight_mode: str) -> float:
+    """Return [0,1] confidence for a MediaPipe NormalizedLandmark."""
+    if weight_mode == "z":
+        return min(1.0, abs(float(lm.z)))
+    v = max(0.0, min(1.0, float(getattr(lm, "visibility", 1.0))))
+    if weight_mode == "visibility":
+        return v
+    p = max(0.0, min(1.0, float(getattr(lm, "presence", v))))
+    if weight_mode == "presence":
+        return p
+    return v * p   # "vis×pres"
 
 
 def _normalized_to_pixel(nx, ny, w, h):
@@ -82,13 +113,24 @@ class PoseTriangulator:
         if self._pose_detector is None:
             if not _MP_AVAILABLE:
                 raise RuntimeError("mediapipe is not installed.")
-            mp_pose = mp.solutions.pose
-            self._pose_detector = mp_pose.Pose(
-                static_image_mode=False,
-                model_complexity=2,
-                min_detection_confidence=0.5,
+
+            if not os.path.exists(_MODEL_PATH):
+                import urllib.request
+                os.makedirs(_MODEL_DIR, exist_ok=True)
+                urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+
+            from mediapipe.tasks import python as _mptasks
+            from mediapipe.tasks.python import vision as _mpvision
+
+            options = _mpvision.PoseLandmarkerOptions(
+                base_options=_mptasks.BaseOptions(model_asset_path=_MODEL_PATH),
+                running_mode=_mpvision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
+            self._pose_detector = _mpvision.PoseLandmarker.create_from_options(options)
         return self._pose_detector
 
     # ------------------------------------------------------------------
@@ -126,13 +168,19 @@ class PoseTriangulator:
     # Detection
     # ------------------------------------------------------------------
 
-    def detect_poses_sequence(self, progress_cb=None):
+    def detect_poses_sequence(self, progress_cb=None,
+                              weight_mode: str = "visibility",
+                              threshold: float = 0.3):
         """Run MediaPipe on every (frame, perspective) pair.
 
         Parameters
         ----------
         progress_cb : callable(int, int) | None
             Called with (current_frame, total_frames) for progress reporting.
+        weight_mode : str
+            One of "visibility", "presence", "vis×pres", "z".
+        threshold : float
+            Landmarks with confidence below this are zeroed out.
         """
         detector = self._get_detector()
         n_perspectives, n_frames = self.frames.shape[0], self.frames.shape[1]
@@ -154,13 +202,19 @@ class PoseTriangulator:
                 elif img.shape[2] == 4:
                     img = img[:, :, :3]
 
-                results = detector.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                mp_image = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=np.ascontiguousarray(img),
+                )
+                result = detector.detect(mp_image)
 
-                if results.pose_landmarks:
-                    lms = np.array([
-                        [*_normalized_to_pixel(lm.x, lm.y, w, h), lm.z]
-                        for lm in results.pose_landmarks.landmark
-                    ], dtype=float)
+                if result.pose_landmarks:
+                    lms = np.zeros((33, 3), dtype=float)
+                    for lm_i, lm in enumerate(result.pose_landmarks[0]):
+                        conf = _landmark_conf(lm, weight_mode)
+                        if conf >= threshold:
+                            px, py = _normalized_to_pixel(lm.x, lm.y, w, h)
+                            lms[lm_i] = [px, py, conf]
                     lms = self._correct_flip(lms, persp_idx)
                 else:
                     lms = np.zeros((33, 3))
