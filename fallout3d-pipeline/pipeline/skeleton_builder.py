@@ -3,7 +3,6 @@ SkeletonBuilder — rigid bone lengths, bind pose, constrained 3D poses, and fra
 """
 
 import numpy as np
-from scipy.spatial.transform import Rotation, Slerp
 
 # -----------------------------------------------------------------------
 # Hierarchy: child → parent (None = root)
@@ -65,15 +64,36 @@ while _queue:
             _queue.append(child)
 
 
-def _vec_to_rotvec(v: np.ndarray) -> np.ndarray:
-    """Return a rotation-vector that rotates [0,0,1] onto the unit vector v."""
-    v = v / (np.linalg.norm(v) + 1e-12)
-    ref = np.array([0.0, 0.0, 1.0])
-    cross = np.cross(ref, v)
-    n = np.linalg.norm(cross)
-    if n < 1e-9:
-        return np.zeros(3) if v[2] > 0 else np.array([np.pi, 0.0, 0.0])
-    return cross / n * np.arcsin(np.clip(n, 0.0, 1.0))
+def _slerp_direction(d1: np.ndarray, d2: np.ndarray, t: float) -> np.ndarray:
+    """
+    Spherical linear interpolation between two unit direction vectors.
+
+    Walks the shorter great-circle arc from d1 to d2 on the unit sphere.
+    Equivalent to twist-free quaternion slerp, without the sign-ambiguity
+    problems of going through quaternions.
+    """
+    d1 = d1 / (np.linalg.norm(d1) + 1e-12)
+    d2 = d2 / (np.linalg.norm(d2) + 1e-12)
+    cos_omega = float(np.clip(np.dot(d1, d2), -1.0, 1.0))
+
+    # Near-identical directions: linear interpolation is numerically safer.
+    if cos_omega > 0.9999:
+        result = (1.0 - t) * d1 + t * d2
+        return result / (np.linalg.norm(result) + 1e-12)
+
+    # Antipodal: slerp is undefined; rotate around an arbitrary perpendicular axis.
+    if cos_omega < -0.9999:
+        perp = np.array([1.0, 0.0, 0.0])
+        if abs(d1[0]) > 0.9:
+            perp = np.array([0.0, 1.0, 0.0])
+        perp = perp - np.dot(perp, d1) * d1
+        perp = perp / (np.linalg.norm(perp) + 1e-12)
+        omega = np.pi * t
+        return np.cos(omega) * d1 + np.sin(omega) * perp
+
+    omega = np.arccos(cos_omega)
+    sin_omega = np.sin(omega)
+    return (np.sin((1.0 - t) * omega) * d1 + np.sin(t * omega) * d2) / sin_omega
 
 
 class SkeletonBuilder:
@@ -206,25 +226,18 @@ class SkeletonBuilder:
                 out[joint_idx] = (1.0 - t) * p_child_a + t * p_child_b
                 continue
 
-            rv_a = _vec_to_rotvec(dir_a / len_a)
-            rv_b = _vec_to_rotvec(dir_b / len_b)
+            unit_a = dir_a / len_a
+            unit_b = dir_b / len_b
 
-            try:
-                rot_a = Rotation.from_rotvec(rv_a)
-                rot_b = Rotation.from_rotvec(rv_b)
-                qa = rot_a.as_quat()
-                qb = rot_b.as_quat()
-                # Fix sign to ensure shortest-path slerp (no "over the head" flip)
-                if np.dot(qa, qb) < 0:
-                    qb = -qb
-                    rot_b = Rotation.from_quat(qb)
-                rots = Rotation.from_quat(np.stack([qa, qb]))
-                slerp_fn = Slerp([0.0, 1.0], rots)
-                dir_interp = slerp_fn(t).apply(np.array([0.0, 0.0, 1.0]))
-            except Exception:
-                dir_interp = (1.0 - t) * dir_a / len_a + t * dir_b / len_b
-                norm = np.linalg.norm(dir_interp)
-                dir_interp = dir_interp / (norm + 1e-12)
+            # Sanity guard: if directions are absurdly far apart (>120°), the
+            # data probably contains a per-frame jump that shouldn't be slerped
+            # through the +Z reference axis.  Fall back to position lerp to
+            # avoid the leg-over-head failure mode.
+            if float(np.dot(unit_a, unit_b)) < -0.5:
+                out[joint_idx] = (1.0 - t) * p_child_a + t * p_child_b
+                continue
+
+            dir_interp = _slerp_direction(unit_a, unit_b, t)
 
             bone_len = self.bone_lengths.get(joint_idx, (len_a + len_b) * 0.5)
             out[joint_idx] = out[parent_idx] + dir_interp * bone_len
