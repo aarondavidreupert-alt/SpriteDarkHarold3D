@@ -414,7 +414,7 @@ class PoseEditorTab(QWidget):
         self._thread: QThread | None = None
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._play_tick)
-        self._selected_view: int | None = None
+        self._selected_view: int = 0
         self._build_ui()
 
         self.state.selection_changed.connect(self._on_char_changed)
@@ -552,12 +552,11 @@ class PoseEditorTab(QWidget):
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._lm_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._lm_table.cellChanged.connect(self._on_conf_cell_changed)
+        self._lm_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         lm_panel_lay.addWidget(self._lm_table)
 
         content_split.addWidget(self._lm_panel)
         content_split.setSizes([800, 260])
-        self._lm_panel.hide()
 
     # ------------------------------------------------------------------
     # Confidence weight mode
@@ -701,8 +700,8 @@ class PoseEditorTab(QWidget):
         char = self.state.current_character
         if char is None:
             return
-        self._selected_view = None
-        self._lm_panel.hide()
+        self._selected_view = 0
+        self._lm_panel_title.setText(f"Direction 1 — {_DIR_LABELS[0]}")
         self.frame_slider.setRange(0, max(0, char.n_frames - 1))
         self.frame_slider.setValue(0)
         self._refresh_views(0)
@@ -734,8 +733,7 @@ class PoseEditorTab(QWidget):
                 pose = char.poses_2d[frame_idx, v]
             self._canvases[v].set_frame(img, pose, show_heatmap)
 
-        if self._selected_view is not None and self._lm_panel.isVisible():
-            self._populate_lm_table()
+        self._populate_lm_table()
 
     # ------------------------------------------------------------------
     # Landmark editing
@@ -786,7 +784,6 @@ class PoseEditorTab(QWidget):
         self._lm_panel_title.setText(
             f"Direction {view_idx + 1} — {_DIR_LABELS[view_idx]}"
         )
-        self._lm_panel.show()
         self._populate_lm_table()
 
     def _populate_lm_table(self):
@@ -802,7 +799,7 @@ class PoseEditorTab(QWidget):
 
             conf = 0.0
             if (char is not None and char.poses_2d is not None
-                    and view is not None and frame < char.poses_2d.shape[0]):
+                    and frame < char.poses_2d.shape[0]):
                 conf = float(char.poses_2d[frame, view, lm_idx, 2])
 
             name_item = QTableWidgetItem(name)
@@ -814,6 +811,7 @@ class PoseEditorTab(QWidget):
             side_item.setBackground(QBrush(bg))
 
             conf_item = QTableWidgetItem(f"{conf:.3f}")
+            conf_item.setFlags(conf_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             conf_item.setBackground(QBrush(bg))
 
             self._lm_table.setItem(lm_idx, 0, name_item)
@@ -821,21 +819,3 @@ class PoseEditorTab(QWidget):
             self._lm_table.setItem(lm_idx, 2, conf_item)
 
         self._lm_table.blockSignals(False)
-
-    def _on_conf_cell_changed(self, row: int, col: int):
-        if col != 2:
-            return
-        char = self.state.current_character
-        if char is None or char.poses_2d is None or self._selected_view is None:
-            return
-        item = self._lm_table.item(row, col)
-        if item is None:
-            return
-        try:
-            val = float(item.text())
-            val = max(0.0, min(1.0, val))
-        except ValueError:
-            return
-        # Write confidence to all frames for this view/landmark
-        char.poses_2d[:, self._selected_view, row, 2] = val
-        self._refresh_views(self.state.current_frame)
