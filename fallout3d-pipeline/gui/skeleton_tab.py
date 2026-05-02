@@ -33,7 +33,7 @@ except ImportError:
 # Color helpers
 # -----------------------------------------------------------------------
 
-# Joint index → side string
+# Joint index → side string (34=Spine Mid, 35=Chest are center)
 _JOINT_SIDE: dict[int, str] = {}
 for _i in [11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 7]:
     _JOINT_SIDE[_i] = "left"
@@ -87,7 +87,7 @@ class _SkeletonGLView(QWidget):
             layout.addStretch()
 
     def show_pose(self, positions: np.ndarray):
-        """positions: (34, 3) — index 33 is virtual hip root."""
+        """positions: (36, 3) — indices 33/34/35 are virtual joints."""
         if not _GL_AVAILABLE:
             return
 
@@ -98,7 +98,8 @@ class _SkeletonGLView(QWidget):
             self._view.removeItem(item)
         self._lines = []
 
-        colors = np.array([_bone_rgba(i) for i in range(34)], dtype=np.float32)
+        n_joints = positions.shape[0]
+        colors = np.array([_bone_rgba(i) for i in range(n_joints)], dtype=np.float32)
         valid = ~np.all(positions == 0, axis=1)
         if valid.any():
             self._scatter = gl.GLScatterPlotItem(
@@ -211,6 +212,30 @@ class SkeletonTab(QWidget):
         vrb.addWidget(self._chk_rigid)
         vbox.addWidget(grp_rb)
 
+        # ── Smoothing group ─────────────────────────────────────────
+        grp_sm = QGroupBox("Smoothing")
+        vsm = QVBoxLayout(grp_sm)
+
+        self._chk_filter = QCheckBox("Low-pass Filter")
+        self._chk_filter.setChecked(False)
+        vsm.addWidget(self._chk_filter)
+
+        row_sig = QHBoxLayout()
+        row_sig.addWidget(QLabel("Sigma:"))
+        self._sigma_slider = QSlider(Qt.Orientation.Horizontal)
+        self._sigma_slider.setRange(1, 10)   # value × 0.5 → [0.5 … 5.0]
+        self._sigma_slider.setValue(3)       # default 1.5
+        self._sigma_slider.setEnabled(False)
+        row_sig.addWidget(self._sigma_slider)
+        self._sigma_lbl = QLabel("1.5")
+        self._sigma_lbl.setFixedWidth(30)
+        row_sig.addWidget(self._sigma_lbl)
+        vsm.addLayout(row_sig)
+
+        self._chk_filter.toggled.connect(self._on_filter_changed)
+        self._sigma_slider.valueChanged.connect(self._on_sigma_changed)
+        vbox.addWidget(grp_sm)
+
         # ── Interpolation group ─────────────────────────────────────
         grp_int = QGroupBox("Interpolation")
         vint = QVBoxLayout(grp_int)
@@ -295,6 +320,12 @@ class SkeletonTab(QWidget):
 
     # ── Calculate ─────────────────────────────────────────────────────
 
+    def _sigma_value(self) -> float | None:
+        """Return current sigma if filter is enabled, else None."""
+        if not self._chk_filter.isChecked():
+            return None
+        return self._sigma_slider.value() * 0.5
+
     def _calculate(self):
         char = self.state.current_character
         if char is None or char.skeleton_3d is None:
@@ -308,7 +339,12 @@ class SkeletonTab(QWidget):
             manual_lengths = self._read_table_lengths()
 
         sb = SkeletonBuilder()
-        sb.build(char.skeleton_3d, mode=mode, manual_lengths=manual_lengths)
+        sb.build(
+            char.skeleton_3d,
+            mode=mode,
+            manual_lengths=manual_lengths,
+            lowpass_sigma=self._sigma_value(),
+        )
         char.skeleton = sb
 
         self._interp_poses = None
@@ -375,10 +411,31 @@ class SkeletonTab(QWidget):
             return
         manual_lengths = self._read_table_lengths()
         sb = SkeletonBuilder()
-        sb.build(char.skeleton_3d, mode="manual", manual_lengths=manual_lengths)
+        sb.build(
+            char.skeleton_3d,
+            mode="manual",
+            manual_lengths=manual_lengths,
+            lowpass_sigma=self._sigma_value(),
+        )
         char.skeleton = sb
         self._update_slider()
         self._show_frame(self._current_frame)
+
+    # ── Smoothing callbacks ───────────────────────────────────────────
+
+    def _on_filter_changed(self, checked: bool):
+        self._sigma_slider.setEnabled(checked)
+        self._recalculate_if_built()
+
+    def _on_sigma_changed(self, value: int):
+        self._sigma_lbl.setText(f"{value * 0.5:.1f}")
+        if self._chk_filter.isChecked():
+            self._recalculate_if_built()
+
+    def _recalculate_if_built(self):
+        char = self.state.current_character
+        if char is not None and char.skeleton_3d is not None and char.skeleton is not None:
+            self._calculate()
 
     # ── Interpolation ─────────────────────────────────────────────────
 

@@ -7,7 +7,10 @@ from scipy.spatial.transform import Rotation, Slerp
 
 # -----------------------------------------------------------------------
 # Hierarchy: child → parent (None = root)
-# Index 33 is the virtual Hip Root (midpoint of hips 23 & 24)
+# Virtual joints:
+#   33 = Hip Root  — midpoint of hips (23+24)/2
+#   34 = Spine Mid — midpoint of hip-root and chest
+#   35 = Chest     — midpoint of shoulders (11+12)/2
 # -----------------------------------------------------------------------
 
 BONE_HIERARCHY: dict[int, int | None] = {
@@ -17,17 +20,21 @@ BONE_HIERARCHY: dict[int, int | None] = {
     27: 25, 28: 26,           # ankles
     29: 27, 30: 28,           # heels
     31: 29, 32: 30,           # feet
-    11: 33, 12: 33,           # shoulders (via virtual spine)
+    34: 33,                   # spine mid
+    35: 34,                   # chest
+    11: 35, 12: 35,           # shoulders from chest
     13: 11, 14: 12,           # elbows
     15: 13, 16: 14,           # wrists
     17: 15, 19: 15, 21: 15,   # left fingers
     18: 16, 20: 16, 22: 16,   # right fingers
-    0: 33,                    # nose → spine
+    0: 33,                    # nose → hip root
     7: 0,  8: 0,              # ears
 }
 
 BONE_NAMES: dict[int, str] = {
     33: "Hip Root",
+    34: "Spine Mid",
+    35: "Chest",
     23: "L-Hip",      24: "R-Hip",
     25: "L-Knee",     26: "R-Knee",
     27: "L-Ankle",    28: "R-Ankle",
@@ -77,13 +84,18 @@ class SkeletonBuilder:
     -----
     sb = SkeletonBuilder()
     sb.build(skeleton_3d, mode="median")   # (N, 33, 3)
-    # sb.poses  → (N, 34, 3)  rigidly constrained, index 33 = Hip Root
+    # sb.poses  → (N, 36, 3)  rigidly constrained
+    #   indices 0-32: MediaPipe joints
+    #   index 33: Hip Root (virtual)
+    #   index 34: Spine Mid (virtual)
+    #   index 35: Chest (virtual)
     """
 
     def __init__(self):
         self.bone_lengths: dict[int, float] = {}
-        self.bind_pose: np.ndarray | None = None    # (34, 3)
-        self.poses: np.ndarray | None = None        # (N, 34, 3)
+        self.clavicle_width: float = 0.0
+        self.bind_pose: np.ndarray | None = None    # (36, 3)
+        self.poses: np.ndarray | None = None        # (N, 36, 3)
 
     # ------------------------------------------------------------------
     # Public API
@@ -94,18 +106,20 @@ class SkeletonBuilder:
         skeleton_3d: np.ndarray,
         mode: str = "median",
         manual_lengths: dict[int, float] | None = None,
+        lowpass_sigma: float | None = None,
     ) -> "SkeletonBuilder":
         """
         Parameters
         ----------
-        skeleton_3d : (N, 33, 3)
-        mode        : "frame0" | "median" | "manual"
-        manual_lengths : required when mode=="manual"
+        skeleton_3d   : (N, 33, 3)
+        mode          : "frame0" | "median" | "manual"
+        manual_lengths: required when mode=="manual"
+        lowpass_sigma : if set, apply Gaussian low-pass filter before constraints
         """
         N = skeleton_3d.shape[0]
 
-        # Build (N, 34, 3) by appending the virtual hip root at index 33
-        full = self._add_hip_root(skeleton_3d)  # (N, 34, 3)
+        # Build (N, 36, 3) with virtual joints 33, 34, 35
+        full = self._add_virtual_joints(skeleton_3d)
 
         # Compute bone lengths
         if mode == "manual" and manual_lengths is not None:
@@ -115,18 +129,36 @@ class SkeletonBuilder:
         else:  # median
             self.bone_lengths = self._measure_lengths(full)
 
+        # Clavicle width is always measured from data (even in manual mode)
+        self.clavicle_width = self._measure_clavicle_width(full)
+
         # Bind pose
         if mode == "frame0":
             self.bind_pose = full[0].copy()
         else:
             self.bind_pose = np.median(full, axis=0)
 
-        # Apply rigid constraints to every frame
+        # Optional low-pass filter before rigid constraint pass
+        if lowpass_sigma is not None and lowpass_sigma > 0:
+            from scipy.ndimage import gaussian_filter1d
+            full = gaussian_filter1d(full, sigma=lowpass_sigma, axis=0)
+
+        # Apply rigid constraints + clavicle constraint to every frame
         constrained = np.zeros_like(full)
         for i in range(N):
-            constrained[i] = self._apply_rigid_constraints(full[i].copy())
+            frame = self._apply_rigid_constraints(full[i].copy())
+            frame = self._apply_clavicle_constraint(frame)
+            constrained[i] = frame
         self.poses = constrained
 
+        return self
+
+    def filter_poses(self, sigma: float = 1.5) -> "SkeletonBuilder":
+        """Apply Gaussian low-pass filter along the frame axis in-place."""
+        if self.poses is None:
+            raise ValueError("Call build() first.")
+        from scipy.ndimage import gaussian_filter1d
+        self.poses = gaussian_filter1d(self.poses, sigma=sigma, axis=0)
         return self
 
     def interpolate(self, frame_a: int, frame_b: int, t: float) -> np.ndarray:
@@ -140,7 +172,7 @@ class SkeletonBuilder:
 
         Returns
         -------
-        (34, 3) interpolated pose
+        (36, 3) interpolated pose
         """
         if self.poses is None:
             raise ValueError("Call build() first.")
@@ -148,7 +180,7 @@ class SkeletonBuilder:
         pa = self.poses[frame_a]
         pb = self.poses[frame_b]
 
-        out = np.zeros((34, 3))
+        out = np.zeros((36, 3))
 
         # Root position: linear interpolation
         out[33] = (1.0 - t) * pa[33] + t * pb[33]
@@ -178,17 +210,27 @@ class SkeletonBuilder:
             rv_b = _vec_to_rotvec(dir_b / len_b)
 
             try:
-                rots = Rotation.from_rotvec(np.stack([rv_a, rv_b]))
-                slerp = Slerp([0.0, 1.0], rots)
-                dir_interp = slerp(t).apply(np.array([0.0, 0.0, 1.0]))
+                rot_a = Rotation.from_rotvec(rv_a)
+                rot_b = Rotation.from_rotvec(rv_b)
+                qa = rot_a.as_quat()
+                qb = rot_b.as_quat()
+                # Fix sign to ensure shortest-path slerp (no "over the head" flip)
+                if np.dot(qa, qb) < 0:
+                    qb = -qb
+                    rot_b = Rotation.from_quat(qb)
+                rots = Rotation.from_quat(np.stack([qa, qb]))
+                slerp_fn = Slerp([0.0, 1.0], rots)
+                dir_interp = slerp_fn(t).apply(np.array([0.0, 0.0, 1.0]))
             except Exception:
-                dir_interp = ((1.0 - t) * dir_a / len_a + t * dir_b / len_b)
+                dir_interp = (1.0 - t) * dir_a / len_a + t * dir_b / len_b
                 norm = np.linalg.norm(dir_interp)
                 dir_interp = dir_interp / (norm + 1e-12)
 
             bone_len = self.bone_lengths.get(joint_idx, (len_a + len_b) * 0.5)
-            parent_pos = out[parent_idx]
-            out[joint_idx] = parent_pos + dir_interp * bone_len
+            out[joint_idx] = out[parent_idx] + dir_interp * bone_len
+
+        # Re-apply clavicle constraint on interpolated frame
+        out = self._apply_clavicle_constraint(out)
 
         return out
 
@@ -197,11 +239,20 @@ class SkeletonBuilder:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _add_hip_root(skeleton_3d: np.ndarray) -> np.ndarray:
-        """Append virtual hip root (mean of joints 23 & 24) as index 33."""
-        N = skeleton_3d.shape[0]
-        hip_root = ((skeleton_3d[:, 23, :] + skeleton_3d[:, 24, :]) / 2.0)[:, np.newaxis, :]
-        return np.concatenate([skeleton_3d, hip_root], axis=1)  # (N, 34, 3)
+    def _add_virtual_joints(skeleton_3d: np.ndarray) -> np.ndarray:
+        """
+        Append virtual joints 33 (Hip Root), 34 (Spine Mid), 35 (Chest).
+        Returns (N, 36, 3).
+        """
+        hip_root  = (skeleton_3d[:, 23, :] + skeleton_3d[:, 24, :]) / 2.0
+        chest     = (skeleton_3d[:, 11, :] + skeleton_3d[:, 12, :]) / 2.0
+        spine_mid = (hip_root + chest) / 2.0
+        return np.concatenate([
+            skeleton_3d,
+            hip_root[:, np.newaxis, :],
+            spine_mid[:, np.newaxis, :],
+            chest[:, np.newaxis, :],
+        ], axis=1)  # (N, 36, 3)
 
     def _measure_lengths(self, full: np.ndarray) -> dict[int, float]:
         """Compute median bone length for each joint across all frames."""
@@ -214,6 +265,13 @@ class SkeletonBuilder:
             nonzero = norms[norms > 1e-9]
             lengths[joint_idx] = float(np.median(nonzero)) if len(nonzero) else 0.0
         return lengths
+
+    def _measure_clavicle_width(self, full: np.ndarray) -> float:
+        """Median distance between left (11) and right (12) shoulder across frames."""
+        diffs = full[:, 11, :] - full[:, 12, :]
+        norms = np.linalg.norm(diffs, axis=1)
+        nonzero = norms[norms > 1e-9]
+        return float(np.median(nonzero)) if len(nonzero) else 0.0
 
     def _apply_rigid_constraints(self, positions: np.ndarray) -> np.ndarray:
         """
@@ -233,9 +291,30 @@ class SkeletonBuilder:
             direction  = child_pos - parent_pos
             dist = np.linalg.norm(direction)
             if dist < 1e-9:
-                # zero-length — pick arbitrary direction
                 direction = np.array([0.0, 1.0, 0.0])
                 dist = 1.0
             positions[joint_idx] = parent_pos + (direction / dist) * bone_len
 
+        return positions
+
+    def _apply_clavicle_constraint(self, positions: np.ndarray) -> np.ndarray:
+        """
+        Enforce locked clavicle width: reproject shoulders 11 and 12
+        symmetrically around chest midpoint (joint 35).
+        """
+        if self.clavicle_width < 1e-9:
+            return positions
+
+        half = self.clavicle_width / 2.0
+        mid  = positions[35]
+
+        clavicle_dir = positions[11] - positions[12]
+        dist = np.linalg.norm(clavicle_dir)
+        if dist < 1e-9:
+            clavicle_dir = np.array([1.0, 0.0, 0.0])
+            dist = 1.0
+        unit = clavicle_dir / dist
+
+        positions[11] = mid + unit * half
+        positions[12] = mid - unit * half
         return positions
