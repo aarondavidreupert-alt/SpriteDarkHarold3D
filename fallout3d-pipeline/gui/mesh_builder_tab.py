@@ -584,6 +584,7 @@ class MeshBuilderTab(QWidget):
         if char is not None:
             char.mesh_verts = verts
             char.skinning_weights = weights
+            self.state.character_updated.emit(self.state.selected_idx)
 
         n_bones = weights.shape[1] if weights is not None else 0
         self.bone_slider.setRange(0, max(0, n_bones - 1))
@@ -938,3 +939,7 @@ class MeshBuilderTab(QWidget):
     def _on_char_updated(self, idx: int):
         if idx == self.state.selected_idx:
             self._on_char_changed(idx)
+
+    def run_fit(self):
+        """Public entry-point for pipeline automation."""
+        self._fit_mesh()

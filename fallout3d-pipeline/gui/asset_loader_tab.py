@@ -26,11 +26,17 @@ from PyQt6.QtWidgets import (
     QComboBox, QListWidget, QListWidgetItem, QFileDialog,
     QScrollArea, QGridLayout, QGroupBox, QSizePolicy, QFrame,
     QProgressBar, QLineEdit, QSpinBox, QSlider,
+    QRadioButton, QCheckBox, QButtonGroup, QMessageBox,
 )
 from PyQt6.QtGui import QPixmap, QImage, QColor
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject
 
 from gui.main_window import AppState, CharacterData, CRITTER_CATEGORIES
+
+_PIPELINE_DIR = os.path.dirname(_GUI_DIR)
+if _PIPELINE_DIR not in sys.path:
+    sys.path.insert(0, _PIPELINE_DIR)
+from config import load_config, save_config
 
 
 # -----------------------------------------------------------------------
@@ -503,6 +509,44 @@ class AssetLoaderTab(QWidget):
         left = QVBoxLayout()
         root.addLayout(left, 1)
 
+        # ── Quick-Start Config ───────────────────────────────────────────
+        qs_box = QGroupBox("Quick-Start Config")
+        qs_layout = QVBoxLayout(qs_box)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Input type:"))
+        self._qs_btn_npy = QRadioButton("Load NPY")
+        self._qs_btn_frm = QRadioButton("Load FRM")
+        self._qs_mode_group = QButtonGroup(self)
+        self._qs_mode_group.addButton(self._qs_btn_npy)
+        self._qs_mode_group.addButton(self._qs_btn_frm)
+        self._qs_btn_npy.setChecked(True)
+        mode_row.addWidget(self._qs_btn_npy)
+        mode_row.addWidget(self._qs_btn_frm)
+        mode_row.addStretch()
+        qs_layout.addLayout(mode_row)
+
+        path_row = QHBoxLayout()
+        self.qs_path_edit = QLineEdit()
+        self.qs_path_edit.setPlaceholderText("Input file path…")
+        path_row.addWidget(self.qs_path_edit, 1)
+        self._qs_browse_btn = QPushButton("Browse…")
+        self._qs_browse_btn.clicked.connect(self._qs_browse)
+        path_row.addWidget(self._qs_browse_btn)
+        qs_layout.addLayout(path_row)
+
+        self._qs_upscale_cb = QCheckBox("Upscale after load")
+        qs_layout.addWidget(self._qs_upscale_cb)
+
+        left.addWidget(qs_box)
+
+        # Connect for auto-save; populate from disk
+        self._qs_btn_npy.toggled.connect(self._qs_save)
+        self._qs_btn_frm.toggled.connect(self._qs_save)
+        self.qs_path_edit.textChanged.connect(self._qs_save)
+        self._qs_upscale_cb.toggled.connect(self._qs_save)
+        self._qs_load_config()
+
         load_box = QGroupBox("Load Asset")
         load_layout = QVBoxLayout(load_box)
 
@@ -681,3 +725,47 @@ class AssetLoaderTab(QWidget):
             f"shape: {shape[0]}dirs × {shape[1]}frames × {shape[2]}×{shape[3]}px"
         )
         self.thumbnail_grid.set_frames(char.frames)
+
+    # ── Quick-Start Config helpers ────────────────────────────────────────
+
+    def _qs_load_config(self):
+        cfg = load_config()
+        mode = cfg.get("input_mode", "npy")
+        (self._qs_btn_frm if mode == "frm" else self._qs_btn_npy).setChecked(True)
+        self.qs_path_edit.blockSignals(True)
+        self.qs_path_edit.setText(cfg.get("input_path", ""))
+        self.qs_path_edit.blockSignals(False)
+        self._qs_upscale_cb.setChecked(bool(cfg.get("upscale", False)))
+
+    def _qs_save(self, *_):
+        save_config({
+            "input_mode": "frm" if self._qs_btn_frm.isChecked() else "npy",
+            "input_path": self.qs_path_edit.text().strip(),
+            "upscale":    self._qs_upscale_cb.isChecked(),
+        })
+
+    def _qs_browse(self):
+        if self._qs_btn_frm.isChecked():
+            filt = "Fallout FRM (*.frm *.FRM);;All Files (*)"
+        else:
+            filt = "NumPy Array (*.npy);;All Files (*)"
+        path, _ = QFileDialog.getOpenFileName(self, "Select Input File", "", filt)
+        if path:
+            self.qs_path_edit.setText(path)
+
+    def load_default(self):
+        """Load the file configured in Quick-Start Config; show warning if missing."""
+        cfg = load_config()
+        path = cfg.get("input_path", "").strip()
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(
+                self, "Quick-Start Config",
+                "Input file not found.\n"
+                "Please set a valid path in the Quick-Start Config panel.",
+            )
+            self._qs_browse()
+            return
+        self.path_edit.setText(path)
+        if not self.name_edit.text():
+            self.name_edit.setText(os.path.splitext(os.path.basename(path))[0])
+        self._load_character()

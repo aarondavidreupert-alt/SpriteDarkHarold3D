@@ -15,11 +15,13 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtCore import Qt, pyqtSignal, QObject
 
 # Pipeline backend
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PIPELINE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PIPELINE_DIR)
 from pipeline import (
     PoseTriangulator, PoseLibrary, MeshFitter,
     NormalMapBaker, GLTFExporter,
 )
+from config import load_config
 
 
 # -----------------------------------------------------------------------
@@ -181,6 +183,9 @@ class MainWindow(QMainWindow):
         # Auto-build skeleton after triangulation completes
         self.state.character_updated.connect(self._auto_build_skeleton)
 
+        # ▶ per-tab play buttons
+        self._add_play_buttons()
+
         # Central widget is set in _build_console() via a QSplitter
 
         # Forward tab changes so status bar stays informative
@@ -271,3 +276,116 @@ class MainWindow(QMainWindow):
         ]
         if 0 <= idx < len(labels):
             self.statusBar().showMessage(labels[idx])
+
+    # ------------------------------------------------------------------
+    # ▶ Per-tab play buttons
+    # ------------------------------------------------------------------
+
+    def _add_play_buttons(self):
+        """Attach a small ▶ button to the right side of every tab label."""
+        from PyQt6.QtWidgets import QPushButton, QTabBar
+        tab_bar = self.tabs.tabBar()
+        for i in range(self.tabs.count()):
+            btn = QPushButton("▶")
+            btn.setFixedSize(22, 18)
+            btn.setFlat(True)
+            btn.setToolTip(f"Run pipeline up to this tab (step {i + 1})")
+            btn.clicked.connect(lambda _checked, idx=i: self.run_pipeline_until(idx))
+            tab_bar.setTabButton(i, QTabBar.ButtonPosition.RightSide, btn)
+
+    # ------------------------------------------------------------------
+    # Pipeline runner
+    # ------------------------------------------------------------------
+
+    # Tab index constants (must match addTab order in _build_tabs)
+    _TAB_ASSET        = 0
+    _TAB_FRM_VIEWER   = 1
+    _TAB_UPSCALER     = 2
+    _TAB_POSE         = 3
+    _TAB_POSE_EDITOR  = 4
+    _TAB_RECON        = 5
+    _TAB_SKELETON     = 6
+    _TAB_LIBRARY      = 7
+    _TAB_MESH         = 8
+    _TAB_MESH_BUILDER = 9
+    _TAB_EXPORT       = 10
+
+    def run_pipeline_until(self, target: int):
+        """Run the full pipeline from asset-load up to and including *target* tab."""
+        from PyQt6.QtCore import QEventLoop, QTimer
+        from PyQt6.QtWidgets import QMessageBox
+
+        cfg        = load_config()
+        input_path = cfg.get("input_path", "").strip()
+        input_mode = cfg.get("input_mode", "npy")
+        upscale    = bool(cfg.get("upscale", False))
+
+        if not input_path or not os.path.exists(input_path):
+            QMessageBox.warning(
+                self, "Quick-Start Config",
+                "Input file not found.\n"
+                "Please set a valid path in Tab 1 → Quick-Start Config.",
+            )
+            self.tabs.setCurrentIndex(self._TAB_ASSET)
+            return
+
+        def _wait(signal, call, timeout_ms: int = 120_000):
+            """Connect signal → call → exec local event loop → disconnect."""
+            loop = QEventLoop()
+            def _quit(*_): loop.quit()
+            signal.connect(_quit)
+            call()
+            QTimer.singleShot(timeout_ms, loop.quit)
+            loop.exec()
+            try:
+                signal.disconnect(_quit)
+            except RuntimeError:
+                pass
+
+        # ── Step 1: load asset ──────────────────────────────────────────
+        self.tabs.setCurrentIndex(self._TAB_ASSET)
+        QApplication.processEvents()
+        prev_count = len(self.state.characters)
+        _wait(self.state.character_added, self.tab_asset.load_default)
+        if len(self.state.characters) <= prev_count:
+            return  # load failed or user cancelled
+
+        # ── Step 2: upscale (FRM + upscale=True only) ───────────────────
+        if upscale and input_mode == "frm" and target >= self._TAB_UPSCALER:
+            self.tabs.setCurrentIndex(self._TAB_UPSCALER)
+            QApplication.processEvents()
+            _wait(self.state.character_upscaled, self.tab_upscaler.run_upscale)
+
+        # ── Step 3: pose detection ──────────────────────────────────────
+        if target >= self._TAB_POSE:
+            self.tabs.setCurrentIndex(self._TAB_POSE)
+            QApplication.processEvents()
+            _wait(self.state.character_updated, self.tab_pose.run_detection)
+
+        # ── Step 4: triangulation ───────────────────────────────────────
+        if target >= self._TAB_RECON:
+            self.tabs.setCurrentIndex(self._TAB_RECON)
+            QApplication.processEvents()
+            _wait(self.state.character_updated, self.tab_recon.run_triangulation)
+
+        # ── Step 5: skeleton build (synchronous) ────────────────────────
+        if target >= self._TAB_SKELETON:
+            self.tabs.setCurrentIndex(self._TAB_SKELETON)
+            QApplication.processEvents()
+            self.tab_skeleton.run_build()
+            QApplication.processEvents()
+
+        # ── Step 6: mesh fit ────────────────────────────────────────────
+        if target >= self._TAB_MESH_BUILDER:
+            self.tabs.setCurrentIndex(self._TAB_MESH_BUILDER)
+            QApplication.processEvents()
+            _wait(self.state.character_updated, self.tab_mesh_builder.run_fit)
+
+        # ── Step 7: export ──────────────────────────────────────────────
+        if target >= self._TAB_EXPORT:
+            self.tabs.setCurrentIndex(self._TAB_EXPORT)
+            QApplication.processEvents()
+            self.tab_export.run_export()
+
+        # ── Switch to target tab when done ──────────────────────────────
+        self.tabs.setCurrentIndex(target)

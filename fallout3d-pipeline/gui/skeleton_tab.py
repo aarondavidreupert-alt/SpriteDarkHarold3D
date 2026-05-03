@@ -549,3 +549,7 @@ class SkeletonTab(QWidget):
             self._slider.blockSignals(False)
             self._current_frame = frame
             self._show_frame(frame)
+
+    def run_build(self):
+        """Public entry-point for pipeline automation."""
+        self._calculate()

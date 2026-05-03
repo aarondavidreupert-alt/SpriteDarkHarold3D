@@ -61,6 +61,8 @@ _patch_torchvision_functional_tensor()
 # Make sure the package root is on the path regardless of cwd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from config import load_config, save_config  # noqa: F401 — re-exported for gui modules
+
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 

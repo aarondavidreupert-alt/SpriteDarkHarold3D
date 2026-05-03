@@ -395,3 +395,7 @@ class UpscalerTab(QWidget):
         else:
             self._up_lbl.clear()
             self._up_dim.setText("(not yet upscaled)")
+
+    def run_upscale(self):
+        """Public entry-point for pipeline automation."""
+        self._run()

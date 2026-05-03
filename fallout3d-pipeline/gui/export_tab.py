@@ -361,3 +361,7 @@ class ExportTab(QWidget):
     def _on_char_updated(self, idx: int):
         if idx == self.state.selected_idx:
             self._update_preview()
+
+    def run_export(self):
+        """Public entry-point for pipeline automation."""
+        self.export_glb()
