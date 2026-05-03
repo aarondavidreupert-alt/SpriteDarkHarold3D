@@ -1,7 +1,7 @@
 """
 Tab 7c — Mesh Template
-Load a saved skeleton JSON, generate a per-bone ragdoll, adjust capsule
-radii interactively, and save the result as a mesh template JSON.
+Pull the rigid skeleton from AppState (same as Tab 7b), generate a per-bone
+ragdoll, adjust capsule radii interactively, and save as a template JSON.
 """
 
 import os
@@ -10,8 +10,8 @@ import logging
 import numpy as np
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QDoubleSpinBox, QScrollArea, QSplitter, QFileDialog, QFrame,
+    QWidget, QVBoxLayout, QPushButton, QLabel,
+    QDoubleSpinBox, QScrollArea, QSplitter, QFileDialog,
     QGroupBox, QFormLayout,
 )
 from PyQt6.QtCore import Qt
@@ -19,14 +19,10 @@ from PyQt6.QtCore import Qt
 from gui.main_window import AppState
 from gui.mesh_tab import MeshViewer3D
 from pipeline.mesh_fitter import MeshFitter
-from pipeline.skeleton_builder import SkeletonBuilder
 
 _logger = logging.getLogger(__name__)
 
-# Bone names in the same order as MeshFitter.generate_ragdoll's per_bone_radii.
-_RAGDOLL_BONE_NAMES = MeshFitter.RAGDOLL_BONE_NAMES
-
-_DEFAULT_RADIUS_SCALE = 0.045
+_BONE_NAMES = MeshFitter.RAGDOLL_BONE_NAMES   # 11 entries (Head + 10 capsules)
 
 
 class MeshTemplateTab(QWidget):
@@ -34,23 +30,26 @@ class MeshTemplateTab(QWidget):
         super().__init__(parent)
         self.state = state
 
-        self._skeleton: SkeletonBuilder | None = None
-        self._skeleton_path: str = ""
-        self._body_height: float = 1.0
-        self._mesh_verts: np.ndarray | None = None
-        self._mesh_faces: np.ndarray | None = None
-        self._radius_spinboxes: dict[str, QDoubleSpinBox] = {}
+        self._rest_pose: np.ndarray | None = None   # (33, 3) first frame
+        self._ragdoll_verts: np.ndarray | None = None
+        self._ragdoll_faces: np.ndarray | None = None
+        self._radius_spins: dict[str, QDoubleSpinBox] = {}
 
         self._build_ui()
+
+        self.state.selection_changed.connect(self._on_char_changed)
+        self.state.character_updated.connect(self._on_char_updated)
+
+        self._on_char_changed(self.state.selected_idx)
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        root = QHBoxLayout(self)
+        root_layout = QVBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter)
+        root_layout.addWidget(splitter)
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
         splitter.setSizes([300, 900])
@@ -61,144 +60,136 @@ class MeshTemplateTab(QWidget):
         vbox.setContentsMargins(6, 6, 6, 6)
         vbox.setSpacing(6)
 
-        # ── Load skeleton
-        grp_load = QGroupBox("Skeleton")
-        v_load = QVBoxLayout(grp_load)
+        # ── Step 1: Skeleton
+        grp1 = QGroupBox("Step 1: Skeleton")
+        v1 = QVBoxLayout(grp1)
+        self.skeleton_lbl = QLabel("Skeleton: not loaded")
+        v1.addWidget(self.skeleton_lbl)
+        btn_use = QPushButton("← Use skeleton from Tab 5b")
+        btn_use.clicked.connect(self._use_skeleton)
+        v1.addWidget(btn_use)
+        vbox.addWidget(grp1)
 
-        self.btn_load = QPushButton("Load Skeleton JSON…")
-        self.btn_load.clicked.connect(self._load_skeleton)
-        v_load.addWidget(self.btn_load)
-
-        self.lbl_file = QLabel("No skeleton loaded.")
-        self.lbl_file.setWordWrap(True)
-        self.lbl_file.setStyleSheet("color: #aaa; font-size: 11px;")
-        v_load.addWidget(self.lbl_file)
-
+        # ── Step 2: Ragdoll
+        grp2 = QGroupBox("Step 2: Ragdoll")
+        v2 = QVBoxLayout(grp2)
         self.btn_generate = QPushButton("Generate Ragdoll")
         self.btn_generate.setEnabled(False)
         self.btn_generate.setStyleSheet("font-weight: bold; padding: 4px 8px;")
         self.btn_generate.clicked.connect(self._rebuild_ragdoll)
-        v_load.addWidget(self.btn_generate)
+        v2.addWidget(self.btn_generate)
+        self.ragdoll_lbl = QLabel("—")
+        v2.addWidget(self.ragdoll_lbl)
+        vbox.addWidget(grp2)
 
-        vbox.addWidget(grp_load)
-
-        sep1 = QFrame()
-        sep1.setFrameShape(QFrame.Shape.HLine)
-        sep1.setFrameShadow(QFrame.Shadow.Sunken)
-        vbox.addWidget(sep1)
-
-        # ── Per-bone radii
-        grp_radii = QGroupBox("Per-Bone Capsule Radius")
-        form = QFormLayout(grp_radii)
+        # ── Step 3: Per-Bone Radii
+        grp3 = QGroupBox("Step 3: Per-Bone Radii")
+        form = QFormLayout(grp3)
         form.setSpacing(4)
-        for name in _RAGDOLL_BONE_NAMES:
+        for name in _BONE_NAMES:
             spin = QDoubleSpinBox()
             spin.setRange(0.005, 0.5)
             spin.setSingleStep(0.001)
             spin.setDecimals(3)
-            spin.setValue(_DEFAULT_RADIUS_SCALE)
+            spin.setValue(0.045)
             spin.valueChanged.connect(self._rebuild_ragdoll)
             form.addRow(name, spin)
-            self._radius_spinboxes[name] = spin
-        vbox.addWidget(grp_radii)
+            self._radius_spins[name] = spin
+        vbox.addWidget(grp3)
 
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setFrameShadow(QFrame.Shadow.Sunken)
-        vbox.addWidget(sep2)
+        # ── Step 4: Save
+        grp4 = QGroupBox("Step 4: Save")
+        v4 = QVBoxLayout(grp4)
+        btn_save = QPushButton("Save Template JSON…")
+        btn_save.clicked.connect(self._save_template)
+        v4.addWidget(btn_save)
+        vbox.addWidget(grp4)
 
-        # ── Save
-        self.btn_save = QPushButton("Save Template JSON…")
-        self.btn_save.setEnabled(False)
-        self.btn_save.clicked.connect(self._save_template)
-        vbox.addWidget(self.btn_save)
-
-        self.lbl_status = QLabel("")
-        self.lbl_status.setWordWrap(True)
-        self.lbl_status.setStyleSheet("color: #88f; font-style: italic;")
-        vbox.addWidget(self.lbl_status)
+        self.status_lbl = QLabel("")
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setStyleSheet("color: #88f; font-style: italic;")
+        vbox.addWidget(self.status_lbl)
 
         vbox.addStretch()
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(panel)
-        scroll.setFixedWidth(280)
+        scroll.setMaximumWidth(320)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         return scroll
 
     def _build_right_panel(self) -> QWidget:
-        self._viewer = MeshViewer3D()
-        return self._viewer
+        self._mesh_viewer = MeshViewer3D()
+        return self._mesh_viewer
 
     # ------------------------------------------------------------------
-    # Actions
+    # Skeleton access (mirrors MeshBuilderTab exactly)
     # ------------------------------------------------------------------
 
-    def _load_skeleton(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Skeleton JSON", "", "JSON Files (*.json)"
-        )
-        if not path:
+    def _animation_skeleton(self) -> np.ndarray | None:
+        char = self.state.current_character
+        if char is None:
+            return None
+        if char.skeleton is not None and getattr(char.skeleton, "poses", None) is not None:
+            return char.skeleton.poses[:, :33, :]
+        return char.skeleton_3d
+
+    # ------------------------------------------------------------------
+    # Step 1
+    # ------------------------------------------------------------------
+
+    def _use_skeleton(self):
+        skel = self._animation_skeleton()
+        if skel is None:
+            self._set_status("No skeleton available — run triangulation first.")
             return
-        try:
-            self._skeleton = SkeletonBuilder.load(path)
-        except Exception as exc:
-            self._set_status(f"Load error: {exc}")
-            _logger.error("Skeleton load failed: %s", exc)
-            return
 
-        self._skeleton_path = path
-        self.lbl_file.setText(os.path.basename(path))
-        self.btn_generate.setEnabled(True)
-        self.btn_save.setEnabled(True)
+        self._rest_pose = skel[0]
 
-        # Derive body height from bind_pose for default radii
-        if self._skeleton.bind_pose is not None:
-            bp = self._skeleton.bind_pose  # (36, 3)
-            feet_mid = (bp[27] + bp[28]) * 0.5
-            h = float(np.linalg.norm(bp[0] - feet_mid))
-            self._body_height = h if h > 1e-6 else 1.0
-        else:
-            self._body_height = 1.0
+        feet_mid = (skel[0, 27] + skel[0, 28]) * 0.5
+        body_height = float(np.linalg.norm(skel[0, 0] - feet_mid))
+        if body_height < 1e-6:
+            body_height = 1.0
+        base_r = body_height * 0.045
 
-        default_r = self._body_height * _DEFAULT_RADIUS_SCALE
-        for spin in self._radius_spinboxes.values():
+        for name, spin in self._radius_spins.items():
             spin.blockSignals(True)
-            spin.setValue(default_r)
+            spin.setValue(base_r * 1.8 if name == "Head" else base_r)
             spin.blockSignals(False)
 
-        self._set_status(f"Skeleton loaded (body height ≈ {self._body_height:.3f}).")
+        self.skeleton_lbl.setText(f"Skeleton: {skel.shape[0]} frames")
+        self.btn_generate.setEnabled(True)
+        self._set_status(f"Skeleton ready ({skel.shape[0]} frames, body h≈{body_height:.3f}).")
         self._rebuild_ragdoll()
 
-    def _get_radii(self) -> dict:
-        return {name: spin.value() for name, spin in self._radius_spinboxes.items()}
+    # ------------------------------------------------------------------
+    # Step 2
+    # ------------------------------------------------------------------
 
     def _rebuild_ragdoll(self):
-        if self._skeleton is None:
+        if self._rest_pose is None:
             return
-        if self._skeleton.bind_pose is None:
-            self._set_status("Skeleton has no bind_pose.")
-            return
-
-        skeleton_33 = self._skeleton.bind_pose[:33]
+        per_bone = {name: spin.value() for name, spin in self._radius_spins.items()}
         try:
             verts, faces = MeshFitter.generate_ragdoll(
-                skeleton_33,
-                per_bone_radii=self._get_radii(),
+                self._rest_pose, per_bone_radii=per_bone
             )
         except Exception as exc:
             self._set_status(f"Ragdoll error: {exc}")
             _logger.error("Ragdoll build error: %s", exc)
             return
+        self._ragdoll_verts = verts
+        self._ragdoll_faces = faces
+        self._mesh_viewer.set_mesh(verts, faces, None, 0)
+        self.ragdoll_lbl.setText(f"{len(verts)} verts, {len(faces)} faces")
 
-        self._mesh_verts = verts
-        self._mesh_faces = faces
-        self._viewer.set_mesh(verts, faces)
-        self._set_status(f"Ragdoll — {len(verts)} verts, {len(faces)} faces.")
+    # ------------------------------------------------------------------
+    # Step 4
+    # ------------------------------------------------------------------
 
     def _save_template(self):
-        if self._mesh_verts is None or self._mesh_faces is None:
+        if self._ragdoll_verts is None or self._ragdoll_faces is None:
             self._set_status("Generate a ragdoll first.")
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -206,13 +197,13 @@ class MeshTemplateTab(QWidget):
         )
         if not path:
             return
-
+        char = self.state.current_character
         template = {
             "version": 1,
-            "source_skeleton": os.path.basename(self._skeleton_path),
-            "bone_radii": self._get_radii(),
-            "ragdoll_verts": self._mesh_verts.tolist(),
-            "ragdoll_faces": self._mesh_faces.tolist(),
+            "source_character": char.name if char is not None else "",
+            "bone_radii": {name: spin.value() for name, spin in self._radius_spins.items()},
+            "ragdoll_verts": self._ragdoll_verts.tolist(),
+            "ragdoll_faces": self._ragdoll_faces.tolist(),
         }
         try:
             with open(path, "w") as f:
@@ -222,6 +213,30 @@ class MeshTemplateTab(QWidget):
             self._set_status(f"Save error: {exc}")
             _logger.error("Template save error: %s", exc)
 
+    # ------------------------------------------------------------------
+    # AppState signal handlers
+    # ------------------------------------------------------------------
+
+    def _on_char_changed(self, idx: int):
+        char = self.state.current_character
+        if char is None:
+            self.skeleton_lbl.setText("Skeleton: not loaded")
+            self.btn_generate.setEnabled(False)
+            return
+        skel = self._animation_skeleton()
+        if skel is not None:
+            self.skeleton_lbl.setText(
+                f"Skeleton: {skel.shape[0]} frames available — click Use to load"
+            )
+        else:
+            self.skeleton_lbl.setText("Skeleton: not loaded")
+
+    def _on_char_updated(self, idx: int):
+        if idx == self.state.selected_idx:
+            self._on_char_changed(idx)
+
+    # ------------------------------------------------------------------
+
     def _set_status(self, text: str):
-        self.lbl_status.setText(text)
+        self.status_lbl.setText(text)
         _logger.info("MeshTemplate: %s", text)
