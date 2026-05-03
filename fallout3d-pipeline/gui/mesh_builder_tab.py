@@ -7,6 +7,7 @@ project onto sprite → AO bake → shadow sprites.
 import os
 import logging
 import numpy as np
+import cv2
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -21,7 +22,6 @@ from gui.mesh_tab import MeshFitWorker, MeshViewer3D
 from pipeline.mesh_fitter import (
     MeshFitter, ANCHORS_BY_CATEGORY, HUMANOID_ANCHORS, compute_skinning_weights,
 )
-from pipeline.isometric_camera_setup5 import IsometricCameraSetup
 from pipeline.ao_baker import AmbientOcclusionBaker
 from pipeline.shadow_sprite import ShadowSpriteGenerator
 from pipeline.pose_triangulator import POSE_CONNECTIONS
@@ -75,6 +75,23 @@ class ProjectionPreview(QLabel):
         self.setStyleSheet("background:#111; color:#aaa; border: 1px solid #333;")
         self.setText("No projection yet.")
         self._base_pixmap: QPixmap | None = None
+
+    def show_image(self, rgb: np.ndarray):
+        """Display a pre-rendered RGB (H,W,3) uint8 array directly."""
+        if rgb is None:
+            return
+        if rgb.dtype != np.uint8:
+            rgb = rgb.astype(np.uint8)
+        if rgb.ndim == 3 and rgb.shape[-1] == 4:
+            rgb = rgb[..., :3]
+        h, w = rgb.shape[:2]
+        qimg = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.width(), self.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(pix)
 
     def show_projection(
         self,
@@ -669,14 +686,38 @@ class MeshBuilderTab(QWidget):
     # Step 5: Projection
     # ------------------------------------------------------------------
 
-    def _camera_setup_for_char(self) -> IsometricCameraSetup | None:
-        char = self.state.current_character
+    def _get_camera_setup(self, char=None):
+        """Return the IsometricCameraSetup used for triangulation.
+
+        Walks up the widget hierarchy to find MainWindow.tab_recon and
+        re-uses its triangulator's camera_setup — the same coordinate system
+        that produced the 3D skeleton. Falls back to a fresh PoseTriangulator
+        sized to the character's sprite frames when the reconstruction tab is
+        not yet accessible (e.g. standalone unit tests).
+        """
+        p = self.parent()
+        while p is not None:
+            if hasattr(p, "tab_recon"):
+                return p.tab_recon._triangulator.camera_setup
+            p = p.parent()
+        # Fallback: build a triangulator with image_size matching the sprites
+        if char is None:
+            char = self.state.current_character
         if char is None or char.frames is None or char.frames.size == 0:
             return None
+        from pipeline.pose_triangulator import PoseTriangulator
         h, w = char.frames[0, 0].shape[:2]
-        return IsometricCameraSetup(image_size=(w, h))
+        return PoseTriangulator(image_size=(w, h)).camera_setup
 
     def _update_projection(self, *_):
+        """Render the back-projected skeleton (+ optional mesh wireframe) onto
+        the sprite for the currently selected direction and frame.
+
+        Works as soon as a skeleton is available; the mesh overlay is added only
+        after a mesh has been fitted.
+        """
+        from gui.reconstruction_tab import ReconstructionTab
+
         char = self.state.current_character
         if char is None or char.frames is None:
             return
@@ -688,56 +729,68 @@ class MeshBuilderTab(QWidget):
         if skel is None:
             return
         n = skel.shape[0]
-        f = max(0, min(self._current_frame, n - 1))
-        f_sprite = max(0, min(f, char.frames.shape[1] - 1))
+        f       = max(0, min(self._current_frame, n - 1))
+        f_spr   = max(0, min(f, char.frames.shape[1] - 1))
 
-        sprite = char.frames[d, f_sprite]
+        sprite = char.frames[d, f_spr]
         if sprite.dtype != np.uint8:
             sprite = sprite.astype(np.uint8)
-        if sprite.shape[-1] == 4:
-            sprite = sprite[..., :3]
+        sprite = sprite[..., :3].copy() if sprite.shape[-1] == 4 else sprite.copy()
 
-        edges_2d = None
-        if self.chk_wireframe.isChecked() and self._mesh_verts is not None:
-            cam = self._camera_setup_for_char()
-            if cam is not None:
-                bp = cam.back_project_points(self._mesh_verts)  # list of 6 × (V, 3)
-                pts = bp[d][:, :2]
-                # Use POSE_CONNECTIONS as a sparse skeleton wireframe overlay,
-                # plus mesh edges if face count is small enough.
-                edges_2d = self._mesh_edges_for_overlay(pts)
+        cam = self._get_camera_setup(char)
+        if cam is None:
+            self._projection.show_image(sprite)
+            return
 
-        shadow_rgba = None
+        cam_w, cam_h = cam.image_size
+        bp_skel = cam.back_project_points(skel[f])   # list of 6 × (33, 3)
+
+        # Skeleton backprojection: colored joints (blue=left, red=right, white=center)
+        img = ReconstructionTab._render_backprojection(sprite, bp_skel[d], cam_w, cam_h)
+
+        # Optional mesh wireframe overlay (green lines via cv2)
+        if self.chk_wireframe.isChecked() and \
+                self._mesh_verts is not None and self._mesh_faces is not None:
+            bp_mesh = cam.back_project_points(self._mesh_verts)  # list of 6 × (V, 3)
+            pts_2d  = bp_mesh[d][:, :2]
+            fh, fw  = img.shape[:2]
+            sx, sy  = fw / cam_w, fh / cam_h
+            faces   = self._mesh_faces
+            if len(faces) > 1500:
+                faces = faces[:: len(faces) // 1500]
+            n_pts = len(pts_2d)
+            for tri in faces:
+                a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+                if a >= n_pts or b >= n_pts or c >= n_pts:
+                    continue
+                pa = (int(pts_2d[a, 0] * sx), int(pts_2d[a, 1] * sy))
+                pb = (int(pts_2d[b, 0] * sx), int(pts_2d[b, 1] * sy))
+                pc = (int(pts_2d[c, 0] * sx), int(pts_2d[c, 1] * sy))
+                cv2.line(img, pa, pb, (80, 255, 120), 1)
+                cv2.line(img, pb, pc, (80, 255, 120), 1)
+                cv2.line(img, pc, pa, (80, 255, 120), 1)
+
+        # Optional shadow composite (drawn last so it sits under the skeleton)
         if self.chk_shadow.isChecked() and self._shadow_sprites is not None:
             if 0 <= d < len(self._shadow_sprites):
                 shadow_rgba = self._shadow_sprites[d]
+                alpha_f = self.alpha_slider.value() / 100.0
+                if shadow_rgba is not None and shadow_rgba.size > 0:
+                    sh, sw = shadow_rgba.shape[:2]
+                    h_, w_ = img.shape[:2]
+                    x0 = max(0, (w_ - sw) // 2)
+                    y0 = max(0, h_ - sh)
+                    x1 = min(w_, x0 + sw)
+                    y1 = min(h_, y0 + sh)
+                    if x1 > x0 and y1 > y0:
+                        sc = shadow_rgba[: y1 - y0, : x1 - x0]
+                        a  = (sc[..., 3:4].astype(np.float32) / 255.0) * alpha_f
+                        img[y0:y1, x0:x1] = (
+                            a * sc[..., :3].astype(np.float32)
+                            + (1.0 - a) * img[y0:y1, x0:x1].astype(np.float32)
+                        ).astype(np.uint8)
 
-        alpha = self.alpha_slider.value() / 100.0
-        self._projection.show_projection(
-            sprite, edges_2d=edges_2d,
-            shadow_rgba=shadow_rgba, shadow_alpha=alpha,
-        )
-
-    def _mesh_edges_for_overlay(self, pts_2d: np.ndarray) -> list:
-        """Return list of edge endpoints in pixel coords for the wireframe overlay."""
-        edges = []
-        if self._mesh_faces is None:
-            return edges
-        # Cap edge count for responsiveness — sample faces if mesh is dense
-        faces = self._mesh_faces
-        max_faces = 1500
-        if faces.shape[0] > max_faces:
-            step = faces.shape[0] // max_faces
-            faces = faces[::step]
-        n_pts = pts_2d.shape[0]
-        for tri in faces:
-            a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-            if a >= n_pts or b >= n_pts or c >= n_pts:
-                continue
-            edges.append((tuple(pts_2d[a]), tuple(pts_2d[b])))
-            edges.append((tuple(pts_2d[b]), tuple(pts_2d[c])))
-            edges.append((tuple(pts_2d[c]), tuple(pts_2d[a])))
-        return edges
+        self._projection.show_image(img)
 
     def _project_all_frames(self):
         char = self.state.current_character
@@ -752,7 +805,7 @@ class MeshBuilderTab(QWidget):
             self._set_status("No skeleton.")
             return
 
-        cam = self._camera_setup_for_char()
+        cam = self._get_camera_setup(char)
         if cam is None:
             self._set_status("No camera setup.")
             return
@@ -760,6 +813,8 @@ class MeshBuilderTab(QWidget):
         n_dirs = char.frames.shape[0]
         n_frames = min(skel.shape[0], char.frames.shape[1])
         h, w = char.frames[0, 0].shape[:2]
+        cam_w, cam_h = cam.image_size
+        sx, sy = w / cam_w, h / cam_h
 
         out = np.zeros((n_dirs, n_frames, h, w, 3), dtype=np.uint8)
         try:
@@ -773,10 +828,10 @@ class MeshBuilderTab(QWidget):
                     if sprite.shape[-1] == 4:
                         sprite = sprite[..., :3]
                     composite = sprite.copy()
-                    pts = bp[d][:, :2].astype(int)
-                    pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
-                    pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
-                    composite[pts[:, 1], pts[:, 0]] = (80, 255, 120)
+                    pts_cam = bp[d][:, :2]
+                    px = np.clip((pts_cam[:, 0] * sx).astype(int), 0, w - 1)
+                    py = np.clip((pts_cam[:, 1] * sy).astype(int), 0, h - 1)
+                    composite[py, px] = (80, 255, 120)
                     out[d, fi] = composite
         except Exception as exc:
             self._set_status(f"Projection error: {exc}")
