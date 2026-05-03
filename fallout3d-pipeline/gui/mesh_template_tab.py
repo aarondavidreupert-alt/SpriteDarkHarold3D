@@ -18,84 +18,15 @@ from PyQt6.QtCore import Qt
 
 from gui.main_window import AppState
 from gui.mesh_tab import MeshViewer3D
-from pipeline.mesh_fitter import _make_sphere, _make_capsule
+from pipeline.mesh_fitter import MeshFitter
 from pipeline.skeleton_builder import SkeletonBuilder
 
 _logger = logging.getLogger(__name__)
 
-# Bone names in the same order as MeshFitter.generate_ragdoll
-_RAGDOLL_BONE_NAMES = [
-    "Head",
-    "Neck",
-    "L Upper Arm",
-    "R Upper Arm",
-    "L Forearm",
-    "R Forearm",
-    "Torso",
-    "L Thigh",
-    "R Thigh",
-    "L Shin",
-    "R Shin",
-]
+# Bone names in the same order as MeshFitter.generate_ragdoll's per_bone_radii.
+_RAGDOLL_BONE_NAMES = MeshFitter.RAGDOLL_BONE_NAMES
 
 _DEFAULT_RADIUS_SCALE = 0.045
-
-
-def _build_ragdoll_per_bone(
-    skeleton: np.ndarray,
-    radii: dict,
-    capsule_segments: int = 8,
-    capsule_rings: int = 4,
-):
-    """Build a ragdoll mesh from a (33, 3) skeleton with per-bone radii.
-
-    The bone layout mirrors MeshFitter.generate_ragdoll: one sphere for
-    the head plus one capsule per named bone.
-    """
-    sk = np.asarray(skeleton, dtype=float)
-
-    shoulders_mid = (sk[11] + sk[12]) * 0.5
-    hips_mid      = (sk[23] + sk[24]) * 0.5
-
-    # (name, p0, p1) — capsule endpoint pairs
-    capsule_defs = [
-        ("Neck",        sk[0],         shoulders_mid),
-        ("L Upper Arm", sk[11],        sk[13]),
-        ("R Upper Arm", sk[12],        sk[14]),
-        ("L Forearm",   sk[13],        sk[15]),
-        ("R Forearm",   sk[14],        sk[16]),
-        ("Torso",       shoulders_mid, hips_mid),
-        ("L Thigh",     sk[23],        sk[25]),
-        ("R Thigh",     sk[24],        sk[26]),
-        ("L Shin",      sk[25],        sk[27]),
-        ("R Shin",      sk[26],        sk[28]),
-    ]
-
-    all_verts = []
-    all_faces = []
-    offset = 0
-
-    head_r = float(radii.get("Head", _DEFAULT_RADIUS_SCALE))
-    hv, hf = _make_sphere(
-        sk[0], head_r,
-        segments=capsule_segments,
-        rings=max(4, capsule_segments),
-    )
-    all_verts.append(hv)
-    all_faces.append(hf + offset)
-    offset += len(hv)
-
-    for name, p0, p1 in capsule_defs:
-        r = float(radii.get(name, _DEFAULT_RADIUS_SCALE))
-        cv, cf = _make_capsule(p0, p1, r, segments=capsule_segments, rings=capsule_rings)
-        all_verts.append(cv)
-        all_faces.append(cf + offset)
-        offset += len(cv)
-
-    return (
-        np.concatenate(all_verts, axis=0).astype(np.float32),
-        np.concatenate(all_faces, axis=0).astype(np.int32),
-    )
 
 
 class MeshTemplateTab(QWidget):
@@ -252,7 +183,10 @@ class MeshTemplateTab(QWidget):
 
         skeleton_33 = self._skeleton.bind_pose[:33]
         try:
-            verts, faces = _build_ragdoll_per_bone(skeleton_33, self._get_radii())
+            verts, faces = MeshFitter.generate_ragdoll(
+                skeleton_33,
+                per_bone_radii=self._get_radii(),
+            )
         except Exception as exc:
             self._set_status(f"Ragdoll error: {exc}")
             _logger.error("Ragdoll build error: %s", exc)
@@ -275,10 +209,10 @@ class MeshTemplateTab(QWidget):
 
         template = {
             "version": 1,
-            "source_skeleton": self._skeleton_path,
+            "source_skeleton": os.path.basename(self._skeleton_path),
             "bone_radii": self._get_radii(),
-            "verts": self._mesh_verts.tolist(),
-            "faces": self._mesh_faces.tolist(),
+            "ragdoll_verts": self._mesh_verts.tolist(),
+            "ragdoll_faces": self._mesh_faces.tolist(),
         }
         try:
             with open(path, "w") as f:

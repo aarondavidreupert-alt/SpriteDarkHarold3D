@@ -503,18 +503,36 @@ class MeshFitter:
     # Ragdoll mesh generation
     # ------------------------------------------------------------------
 
+    # Bone-name order used by generate_ragdoll's per_bone_radii dict.
+    # The first entry "Head" applies to the head sphere; the remaining 10
+    # entries apply 1:1 to the bones list inside generate_ragdoll.
+    RAGDOLL_BONE_NAMES: List[str] = [
+        "Head",
+        "Neck",
+        "L Upper Arm", "R Upper Arm",
+        "L Forearm",   "R Forearm",
+        "Torso",
+        "L Thigh",     "R Thigh",
+        "L Shin",      "R Shin",
+    ]
+
     @staticmethod
     def generate_ragdoll(
         skeleton: np.ndarray,
         capsule_segments: int = 8,
         capsule_rings: int = 4,
         radius_scale: float = 0.045,
+        per_bone_radii: Optional[Dict[str, float]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Build a capsule-based ragdoll mesh from a MediaPipe skeleton (33, 3).
 
         Generates a sphere for the head and a capsule for each bone,
         sized relative to the body height.
+
+        When per_bone_radii is provided, each named bone uses its own
+        radius (in world units) instead of the global radius_scale.
+        Bone name keys must match MeshFitter.RAGDOLL_BONE_NAMES.
         """
         sk = np.asarray(skeleton, dtype=float)
         if sk.shape[0] < 29:
@@ -531,26 +549,31 @@ class MeshFitter:
         shoulders_mid = (sk[11] + sk[12]) * 0.5
         hips_mid      = (sk[23] + sk[24]) * 0.5
 
+        # Capsule definitions in the same order as RAGDOLL_BONE_NAMES[1:]
         bones: List[Tuple[np.ndarray, np.ndarray]] = [
-            (sk[0],         shoulders_mid),  # neck
-            (sk[11],        sk[13]),         # L upper arm
-            (sk[12],        sk[14]),         # R upper arm
-            (sk[13],        sk[15]),         # L forearm
-            (sk[14],        sk[16]),         # R forearm
-            (shoulders_mid, hips_mid),       # torso
-            (sk[23],        sk[25]),         # L thigh
-            (sk[24],        sk[26]),         # R thigh
-            (sk[25],        sk[27]),         # L shin
-            (sk[26],        sk[28]),         # R shin
+            (sk[0],         shoulders_mid),  # Neck
+            (sk[11],        sk[13]),         # L Upper Arm
+            (sk[12],        sk[14]),         # R Upper Arm
+            (sk[13],        sk[15]),         # L Forearm
+            (sk[14],        sk[16]),         # R Forearm
+            (shoulders_mid, hips_mid),       # Torso
+            (sk[23],        sk[25]),         # L Thigh
+            (sk[24],        sk[26]),         # R Thigh
+            (sk[25],        sk[27]),         # L Shin
+            (sk[26],        sk[28]),         # R Shin
         ]
 
         all_verts: List[np.ndarray] = []
         all_faces: List[np.ndarray] = []
         offset = 0
 
-        # Head (sphere at landmark 0, slightly larger than capsule radius)
+        # Head sphere — per-bone override falls back to radius * 1.8
+        if per_bone_radii is not None and "Head" in per_bone_radii:
+            head_radius = float(per_bone_radii["Head"])
+        else:
+            head_radius = radius * 1.8
         hv, hf = _make_sphere(
-            sk[0], radius * 1.8,
+            sk[0], head_radius,
             segments=capsule_segments,
             rings=max(4, capsule_segments),
         )
@@ -558,9 +581,13 @@ class MeshFitter:
         all_faces.append(hf + offset)
         offset += len(hv)
 
-        for p0, p1 in bones:
+        for (p0, p1), bone_name in zip(bones, MeshFitter.RAGDOLL_BONE_NAMES[1:]):
+            if per_bone_radii is not None and bone_name in per_bone_radii:
+                r = float(per_bone_radii[bone_name])
+            else:
+                r = radius
             cv, cf = _make_capsule(
-                p0, p1, radius,
+                p0, p1, r,
                 segments=capsule_segments,
                 rings=capsule_rings,
             )
