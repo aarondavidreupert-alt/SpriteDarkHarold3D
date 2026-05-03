@@ -150,6 +150,7 @@ class MainWindow(QMainWindow):
         from gui.pose_library_tab import PoseLibraryTab
         from gui.mesh_tab import MeshTab
         from gui.mesh_builder_tab import MeshBuilderTab
+        from gui.mesh_template_tab import MeshTemplateTab
         from gui.export_tab import ExportTab
 
         self.tabs = QTabWidget()
@@ -166,6 +167,7 @@ class MainWindow(QMainWindow):
         self.tab_library          = PoseLibraryTab(self.state, self)
         self.tab_mesh             = MeshTab(self.state, self)
         self.tab_mesh_builder     = MeshBuilderTab(self.state, self)
+        self.tab_mesh_template    = MeshTemplateTab(self.state, self)
         self.tab_export           = ExportTab(self.state, self)
 
         self.tabs.addTab(self.tab_asset,            "1 · Asset Loader")
@@ -178,6 +180,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_library,          "6 · Pose Library")
         self.tabs.addTab(self.tab_mesh,             "7 · Mesh & Normals")
         self.tabs.addTab(self.tab_mesh_builder,     "7b · Mesh Builder")
+        self.tabs.addTab(self.tab_mesh_template,    "7c · Mesh Template")
         self.tabs.addTab(self.tab_export,           "8 · Export")
 
         # Auto-build skeleton after triangulation completes
@@ -272,6 +275,7 @@ class MainWindow(QMainWindow):
             "Average poses across multiple characters",
             "Fit mesh template and bake normal maps",
             "Fit mesh to skeleton, animate, project onto sprite views",
+            "Load skeleton JSON, build ragdoll, adjust radii, save template",
             "Export glTF / GLB and animation data",
         ]
         if 0 <= idx < len(labels):
@@ -298,17 +302,18 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     # Tab index constants (must match addTab order in _build_tabs)
-    _TAB_ASSET        = 0
-    _TAB_FRM_VIEWER   = 1
-    _TAB_UPSCALER     = 2
-    _TAB_POSE         = 3
-    _TAB_POSE_EDITOR  = 4
-    _TAB_RECON        = 5
-    _TAB_SKELETON     = 6
-    _TAB_LIBRARY      = 7
-    _TAB_MESH         = 8
-    _TAB_MESH_BUILDER = 9
-    _TAB_EXPORT       = 10
+    _TAB_ASSET          = 0
+    _TAB_FRM_VIEWER     = 1
+    _TAB_UPSCALER       = 2
+    _TAB_POSE           = 3
+    _TAB_POSE_EDITOR    = 4
+    _TAB_RECON          = 5
+    _TAB_SKELETON       = 6
+    _TAB_LIBRARY        = 7
+    _TAB_MESH           = 8
+    _TAB_MESH_BUILDER   = 9
+    _TAB_MESH_TEMPLATE  = 10
+    _TAB_EXPORT         = 11
 
     def run_pipeline_until(self, target: int):
         """Run the full pipeline from asset-load up to and including *target* tab."""

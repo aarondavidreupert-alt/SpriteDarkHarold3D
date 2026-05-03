@@ -181,6 +181,56 @@ class SkeletonBuilder:
         self.poses = gaussian_filter1d(self.poses, sigma=sigma, axis=0)
         return self
 
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
+
+    def to_dict(self, include_poses: bool = False) -> dict:
+        """Serialize to a JSON-compatible dict.
+
+        Keys: version=1, bone_lengths (str keys), clavicle_width,
+        bind_pose (list[list[float]], shape 36×3).
+        If include_poses=True, also writes poses (N×36×3).
+        """
+        data: dict = {
+            "version": 1,
+            "bone_lengths": {str(k): float(v) for k, v in self.bone_lengths.items()},
+            "clavicle_width": float(self.clavicle_width),
+            "bind_pose": self.bind_pose.tolist() if self.bind_pose is not None else None,
+        }
+        if include_poses and self.poses is not None:
+            data["poses"] = self.poses.tolist()
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SkeletonBuilder":
+        """Restore a SkeletonBuilder from to_dict() output.
+
+        Reconstructs bone_lengths (int keys), clavicle_width, bind_pose,
+        and poses (None if not present in data).
+        """
+        sb = cls()
+        sb.bone_lengths = {int(k): float(v) for k, v in data["bone_lengths"].items()}
+        sb.clavicle_width = float(data.get("clavicle_width", 0.0))
+        bp = data.get("bind_pose")
+        sb.bind_pose = np.array(bp, dtype=np.float64) if bp is not None else None
+        poses = data.get("poses")
+        sb.poses = np.array(poses, dtype=np.float64) if poses is not None else None
+        return sb
+
+    def save(self, path: str, include_poses: bool = False):
+        import json
+        with open(path, "w") as f:
+            json.dump(self.to_dict(include_poses), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "SkeletonBuilder":
+        import json
+        with open(path) as f:
+            return cls.from_dict(json.load(f))
+
+    # ------------------------------------------------------------------
+
     def interpolate(self, frame_a: int, frame_b: int, t: float) -> np.ndarray:
         """
         Interpolate between two frames using slerp on bone rotations.
