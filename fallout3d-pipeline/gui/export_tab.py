@@ -349,7 +349,6 @@ class ExportTab(QWidget):
         if char is None:
             return
         if char.mesh_verts is not None and char.skeleton_3d is not None:
-            from pipeline.mesh_fitter import _stub_faces
             faces = _stub_faces(char.mesh_verts)
             self._preview.set_mesh(char.mesh_verts, faces)
         elif char.skeleton_3d is not None:
