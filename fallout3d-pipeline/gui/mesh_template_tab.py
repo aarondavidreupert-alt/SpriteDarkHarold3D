@@ -27,6 +27,7 @@ from gui.main_window import AppState
 from gui.mesh_tab import MeshViewer3D
 from gui.mesh_builder_tab import ProjectionPreview
 from pipeline.mesh_fitter import MeshFitter
+from pipeline.pose_triangulator import POSE_CONNECTIONS
 
 _logger = logging.getLogger(__name__)
 
@@ -443,8 +444,10 @@ class MeshTemplateTab(QWidget):
 
     def _rebuild_ragdoll(self):
         if self._carved:
-            # Carved geometry is destructive — preserve it until the user
-            # clicks 'Generate Ragdoll' again.
+            # Carved geometry is static — animate the skeleton overlay
+            # on top of it instead of regenerating the ragdoll mesh.
+            self._update_skeleton_overlay()
+            self._update_projection()
             return
         sk = self._current_skeleton_frame()
         if sk is None:
@@ -462,6 +465,18 @@ class MeshTemplateTab(QWidget):
         self._mesh_viewer.set_mesh(verts, faces, None, 0)
         self.ragdoll_lbl.setText(f"{len(verts)} verts, {len(faces)} faces")
         self._update_projection()
+
+    def _update_skeleton_overlay(self):
+        """Push the current frame's skeleton joints into the 3D viewer."""
+        if self._skel_frames is None or self._skel_frames.shape[0] == 0:
+            return
+        f = max(0, min(self._current_frame, self._skel_frames.shape[0] - 1))
+        try:
+            self._mesh_viewer.set_skeleton_overlay(
+                self._skel_frames[f], POSE_CONNECTIONS,
+            )
+        except Exception as exc:
+            _logger.warning("skeleton overlay update failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 4: Animate
@@ -663,6 +678,7 @@ class MeshTemplateTab(QWidget):
         self._ragdoll_faces = faces_c
         self._carved = True
         self._mesh_viewer.set_mesh(verts_c, faces_c, None, 0)
+        self._update_skeleton_overlay()
         self.ragdoll_lbl.setText(
             f"{len(verts_c)} verts, {len(faces_c)} faces (carved, {N}×{D})"
         )
