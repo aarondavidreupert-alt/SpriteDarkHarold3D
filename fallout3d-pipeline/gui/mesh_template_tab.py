@@ -597,9 +597,14 @@ class MeshTemplateTab(QWidget):
     # ------------------------------------------------------------------
 
     def _carve_hull(self):
+        from PyQt6.QtWidgets import QApplication
+
         char = self.state.current_character
-        if char is None or self._ragdoll_verts is None or self._ragdoll_faces is None:
-            self._set_status("Generate a ragdoll first.")
+        if char is None:
+            self._set_status("No character loaded.")
+            return
+        if self._skel_frames is None:
+            self._set_status("Click 'Use skeleton from Tab 5b' first.")
             return
         if self._masks_cache is None:
             try:
@@ -612,9 +617,42 @@ class MeshTemplateTab(QWidget):
             self._set_status("No camera setup available.")
             return
 
+        radii = self._radii_dict()
+        N = self._skel_frames.shape[0]
+        D = self._masks_cache.shape[0]
+
+        # Accumulate per-frame ragdolls into one mesh so the carve
+        # represents the full animation envelope rather than a single pose.
+        all_verts: list[np.ndarray] = []
+        all_faces: list[np.ndarray] = []
+        offset = 0
+        try:
+            for fi in range(N):
+                v, f = MeshFitter.generate_ragdoll(
+                    self._skel_frames[fi], per_bone_radii=radii,
+                )
+                all_verts.append(v)
+                all_faces.append(f + offset)
+                offset += len(v)
+                for di in range(D):
+                    _logger.info("Carving frame %d/%d dir %d/%d", fi + 1, N, di + 1, D)
+                self._set_status(f"Accumulating ragdoll: frame {fi + 1}/{N}")
+                QApplication.processEvents()
+        except Exception as exc:
+            self._set_status(f"Ragdoll accumulation error: {exc}")
+            _logger.error("Accumulation error: %s", exc)
+            return
+
+        accum_v = np.concatenate(all_verts, axis=0)
+        accum_f = np.concatenate(all_faces, axis=0)
+        _logger.info(
+            "Accumulated %d verts / %d faces across %d frames; carving by %d unioned masks",
+            len(accum_v), len(accum_f), N, D,
+        )
+
         try:
             verts_c, faces_c = self._carve_visual_hull(
-                self._ragdoll_verts, self._ragdoll_faces, self._masks_cache, cam,
+                accum_v, accum_f, self._masks_cache, cam,
             )
         except Exception as exc:
             self._set_status(f"Carve error: {exc}")
@@ -625,9 +663,13 @@ class MeshTemplateTab(QWidget):
         self._ragdoll_faces = faces_c
         self._carved = True
         self._mesh_viewer.set_mesh(verts_c, faces_c, None, 0)
-        self.ragdoll_lbl.setText(f"{len(verts_c)} verts, {len(faces_c)} faces (carved)")
+        self.ragdoll_lbl.setText(
+            f"{len(verts_c)} verts, {len(faces_c)} faces (carved, {N}×{D})"
+        )
         self._update_projection()
-        self._set_status(f"Carve done — {len(verts_c)} verts, {len(faces_c)} faces.")
+        self._set_status(
+            f"Carve done — {N} frames × {D} dirs → {len(verts_c)} verts, {len(faces_c)} faces."
+        )
 
     @staticmethod
     def _carve_visual_hull(verts, faces, masks, cam_setup):
