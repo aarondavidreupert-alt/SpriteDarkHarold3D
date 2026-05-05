@@ -41,6 +41,30 @@ _DIR_LABELS = ["Dir0 NE", "Dir1 E", "Dir2 SE", "Dir3 SW", "Dir4 W", "Dir5 NW"]
 # Workers
 # -----------------------------------------------------------------------
 
+class SausageWorker(QObject):
+    """Runs VoxelCarver.carve_all in a background thread."""
+    progress = pyqtSignal(int, int)   # (done, total) — not yet granular
+    finished = pyqtSignal(list)       # list[dict] from to_glb_meshes()
+    error    = pyqtSignal(str)
+
+    def __init__(self, skeleton_builder, camera_setup, all_masks, resolution):
+        super().__init__()
+        self._sb       = skeleton_builder
+        self._cam      = camera_setup
+        self._masks    = all_masks
+        self._res      = resolution
+
+    def run(self):
+        try:
+            from pipeline.voxel_carver import VoxelCarver
+            vc = VoxelCarver(self._sb, self._cam, self._res)
+            vc.carve_all(self._masks)
+            meshes = vc.to_glb_meshes()
+            self.finished.emit(meshes)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class AOBakeWorker(QObject):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(object)   # ao array (V,)
@@ -182,6 +206,8 @@ class MeshBuilderTab(QWidget):
         self._fit_worker: MeshFitWorker | None = None
         self._ao_thread: QThread | None = None
         self._ao_worker: AOBakeWorker | None = None
+        self._sausage_thread: QThread | None = None
+        self._sausage_worker: SausageWorker | None = None
 
         self._build_ui()
 
@@ -407,6 +433,35 @@ class MeshBuilderTab(QWidget):
         self.shadow_status_lbl = QLabel("—")
         v7.addWidget(self.shadow_status_lbl)
         vbox.addWidget(grp7)
+
+        # ── Step 8: Voxel Carve
+        grp8 = QGroupBox("Step 8: Voxel Carve Sausages")
+        v8 = QVBoxLayout(grp8)
+
+        row_res = QHBoxLayout()
+        row_res.addWidget(QLabel("Resolution:"))
+        self.sausage_res_combo = QComboBox()
+        for r in (16, 32, 64):
+            self.sausage_res_combo.addItem(str(r), r)
+        self.sausage_res_combo.setCurrentIndex(1)  # default 32
+        row_res.addWidget(self.sausage_res_combo, 1)
+        v8.addLayout(row_res)
+
+        self.btn_carve_sausages = QPushButton("Carve Voxel Sausages (all frames)")
+        self.btn_carve_sausages.setStyleSheet("font-weight: bold; padding: 4px 8px;")
+        self.btn_carve_sausages.clicked.connect(self._carve_voxel_sausages)
+        v8.addWidget(self.btn_carve_sausages)
+
+        self.sausage_progress = QProgressBar()
+        self.sausage_progress.setRange(0, 0)
+        self.sausage_progress.setVisible(False)
+        v8.addWidget(self.sausage_progress)
+
+        self.sausage_status_lbl = QLabel("—")
+        self.sausage_status_lbl.setWordWrap(True)
+        v8.addWidget(self.sausage_status_lbl)
+
+        vbox.addWidget(grp8)
 
         # Status
         self.status_lbl = QLabel("")
@@ -908,6 +963,97 @@ class MeshBuilderTab(QWidget):
         self._set_status("Shadow sprites ready.")
         if self.chk_shadow.isChecked():
             self._update_projection()
+
+    # ------------------------------------------------------------------
+    # Step 8: Voxel carve sausages
+    # ------------------------------------------------------------------
+
+    def _carve_voxel_sausages(self):
+        char = self.state.current_character
+        if char is None:
+            self._set_status("No character loaded.")
+            return
+        sb = getattr(char, "skeleton", None)
+        if sb is None or getattr(sb, "poses", None) is None:
+            self._set_status("No skeleton with poses — run triangulation first.")
+            return
+        usc = getattr(char, "upscaled_frames", None)
+        if usc is None:
+            self._set_status("No upscaled frames — run upscaler first.")
+            return
+
+        cam = self._get_camera_setup(char)
+        if cam is None:
+            self._set_status("Camera setup not available.")
+            return
+
+        # usc is (6, N, H, W, C) — direction-major
+        n_dirs, n_frames = usc.shape[0], usc.shape[1]
+        all_masks = []
+        for f in range(n_frames):
+            frame_masks = []
+            for d in range(n_dirs):
+                img = usc[d, f]
+                if img.ndim == 3 and img.shape[-1] == 4:
+                    mask = (img[:, :, 3] > 0).astype(np.uint8)
+                else:
+                    mask = (img.mean(axis=-1) > 10).astype(np.uint8)
+                frame_masks.append(mask)
+            all_masks.append(frame_masks)
+
+        resolution = self.sausage_res_combo.currentData()
+
+        self.btn_carve_sausages.setEnabled(False)
+        self.sausage_progress.setVisible(True)
+        self.sausage_status_lbl.setText("Carving …")
+
+        self._sausage_worker = SausageWorker(sb, cam, all_masks, resolution)
+        self._sausage_thread = QThread(self)
+        self._sausage_worker.moveToThread(self._sausage_thread)
+        self._sausage_thread.started.connect(self._sausage_worker.run)
+        self._sausage_worker.finished.connect(self._on_sausage_done)
+        self._sausage_worker.error.connect(self._on_sausage_error)
+        self._sausage_thread.start()
+
+    def _on_sausage_done(self, meshes: list):
+        self._sausage_thread.quit()
+        self.sausage_progress.setVisible(False)
+        self.btn_carve_sausages.setEnabled(True)
+
+        if not meshes:
+            self.sausage_status_lbl.setText("Carve produced no meshes.")
+            self._set_status("Voxel carve: no surviving voxels.")
+            return
+
+        total_v = sum(len(m["verts_local"]) for m in meshes)
+        total_f = sum(len(m["faces"]) for m in meshes)
+        self.sausage_status_lbl.setText(
+            f"{len(meshes)} bones, {total_v} verts, {total_f} faces"
+        )
+        self._set_status(f"Voxel sausages ready — {len(meshes)} bones.")
+
+        # Merge all bones into a single world-space mesh for the 3D viewer.
+        # Each sausage's verts_local are in bone-local space; we concatenate
+        # them without re-transforming here (they share world scale because
+        # the grid origin is in local metres).
+        all_v, all_f = [], []
+        offset = 0
+        for m in meshes:
+            all_v.append(m["verts_local"])
+            all_f.append(m["faces"] + offset)
+            offset += len(m["verts_local"])
+
+        if all_v:
+            merged_v = np.concatenate(all_v, axis=0)
+            merged_f = np.concatenate(all_f, axis=0)
+            self._mesh_viewer.set_mesh(merged_v, merged_f, None, 0)
+
+    def _on_sausage_error(self, msg: str):
+        self._sausage_thread.quit()
+        self.sausage_progress.setVisible(False)
+        self.btn_carve_sausages.setEnabled(True)
+        self.sausage_status_lbl.setText(f"Error: {msg}")
+        self._set_status(f"Voxel carve error: {msg}")
 
     # ------------------------------------------------------------------
     # State updates
