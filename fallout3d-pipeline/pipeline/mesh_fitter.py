@@ -599,3 +599,29 @@ class MeshFitter:
             np.concatenate(all_verts, axis=0).astype(np.float32),
             np.concatenate(all_faces, axis=0).astype(np.int32),
         )
+
+    # ------------------------------------------------------------------
+    # Voxel sausage carving
+    # ------------------------------------------------------------------
+
+    def carve_voxel_sausages(self, skeleton_builder, camera_setup,
+                             all_silhouette_masks, resolution: int = 32):
+        """
+        Build per-bone voxel grids, carve against all frames' silhouettes,
+        and bake each bone's surviving voxels to a triangle mesh.
+
+        Parameters
+        ----------
+        skeleton_builder : SkeletonBuilder
+        camera_setup     : IsometricCameraSetup
+        all_silhouette_masks : list of F entries, each a list of 6 (H,W) uint8 arrays
+        resolution       : voxel grid side length (16 / 32 / 64)
+
+        Results stored in self.voxel_sausages (list of dict) and
+        self.voxel_carver (VoxelCarver).
+        """
+        from .voxel_carver import VoxelCarver
+        vc = VoxelCarver(skeleton_builder, camera_setup, resolution)
+        vc.carve_all(all_silhouette_masks)
+        self.voxel_carver   = vc
+        self.voxel_sausages = vc.to_glb_meshes()
