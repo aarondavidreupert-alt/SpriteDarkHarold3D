@@ -423,6 +423,7 @@ class MeshTemplateTab(QWidget):
         self.btn_generate.setEnabled(True)
         self._set_status(f"Skeleton ready ({n} frames, body h≈{body_height:.3f}).")
         self._rebuild_ragdoll()
+        self.btn_carve.setEnabled(True)
 
     # ------------------------------------------------------------------
     # Step 2/3: Ragdoll generation
@@ -464,6 +465,7 @@ class MeshTemplateTab(QWidget):
         self._ragdoll_faces = faces
         self._mesh_viewer.set_mesh(verts, faces, None, 0)
         self.ragdoll_lbl.setText(f"{len(verts)} verts, {len(faces)} faces")
+        self.btn_carve.setEnabled(True)
         self._update_projection()
 
     def _update_skeleton_overlay(self):
@@ -830,6 +832,7 @@ class MeshTemplateTab(QWidget):
     def _on_char_changed(self, idx: int):
         # Reset cached masks/skeleton when the active character changes
         self._masks_cache = None
+        self.btn_carve.setEnabled(False)
         char = self.state.current_character
         if char is None:
             self.skeleton_lbl.setText("Skeleton: not loaded")
