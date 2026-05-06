@@ -52,6 +52,53 @@ _BONE_COLOURS = [
 # CarveWorker
 # ---------------------------------------------------------------------------
 
+class BakeAllWorker(QObject):
+    """Bake per-frame world-space mesh in a background thread."""
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object, object)  # (mesh_frames (N,V,3), faces (F,3))
+    error    = pyqtSignal(str)
+
+    def __init__(self, carver: VoxelCarver, n_frames: int, world_res: int = 64):
+        super().__init__()
+        self._carver    = carver
+        self._n_frames  = n_frames
+        self._world_res = world_res
+
+    def run(self):
+        try:
+            poses = self._carver.skeleton_builder.poses
+            n = min(self._n_frames, int(poses.shape[0]))
+
+            world_lo, world_hi = self._carver.world_bounds(n)
+
+            rest_v, rest_f = self._carver.bake_frame_world(
+                0, world_lo, world_hi, self._world_res)
+            if rest_v is None or rest_f is None:
+                self.error.emit("Frame 0 produced no mesh — carve voxels first.")
+                return
+
+            V = len(rest_v)
+            frames = [rest_v]
+            self.progress.emit(1, n)
+
+            for f in range(1, n):
+                v, _ = self._carver.bake_frame_world(
+                    f, world_lo, world_hi, self._world_res)
+                if v is not None and len(v) == V:
+                    frames.append(v)
+                else:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "bake_frame_world frame %d: vertex count %s ≠ %d, "
+                        "using rest pose", f, len(v) if v is not None else None, V)
+                    frames.append(rest_v)
+                self.progress.emit(f + 1, n)
+
+            self.finished.emit(np.stack(frames, axis=0), rest_f)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class CarveWorker(QObject):
     progress = pyqtSignal(int, int)   # (done, total)
     finished = pyqtSignal()
@@ -90,6 +137,7 @@ class VoxelSausageTab(QWidget):
         self._current_frame = 0
         self._mesh_verts: np.ndarray | None = None
         self._mesh_faces: np.ndarray | None = None
+        self._mesh_frames: np.ndarray | None = None  # (N, V, 3) from Bake All Frames
         self._bone_weights: np.ndarray | None = None
         self._scatter_items: list = []       # GLScatterPlotItem refs
 
@@ -97,6 +145,8 @@ class VoxelSausageTab(QWidget):
         self._play_timer.timeout.connect(self._advance_frame)
         self._carve_thread: QThread | None = None
         self._carve_worker: CarveWorker | None = None
+        self._bake_thread: QThread | None = None
+        self._bake_worker: BakeAllWorker | None = None
 
         self._radius_spins: dict[int, QDoubleSpinBox] = {}
 
@@ -266,10 +316,29 @@ class VoxelSausageTab(QWidget):
         # ── Step 6: Bake Mesh ─────────────────────────────────────────
         grp6 = QGroupBox("Step 6: Bake Mesh")
         v6   = QVBoxLayout(grp6)
-        btn_bake = QPushButton("Bake Mesh (marching cubes)")
+        btn_bake = QPushButton("Bake Mesh (frame 0)")
         btn_bake.setStyleSheet("font-weight: bold;")
         btn_bake.clicked.connect(self._bake_mesh)
         v6.addWidget(btn_bake)
+
+        row_res = QHBoxLayout()
+        row_res.addWidget(QLabel("World res:"))
+        self.bake_res_combo = QComboBox()
+        for r in (32, 64, 96):
+            self.bake_res_combo.addItem(str(r), r)
+        self.bake_res_combo.setCurrentIndex(1)   # default 64
+        row_res.addWidget(self.bake_res_combo, 1)
+        v6.addLayout(row_res)
+
+        self.btn_bake_all = QPushButton("Bake All Frames")
+        self.btn_bake_all.setStyleSheet("font-weight: bold;")
+        self.btn_bake_all.clicked.connect(self._bake_all_frames)
+        v6.addWidget(self.btn_bake_all)
+        self.bake_all_progress = QProgressBar()
+        self.bake_all_progress.setRange(0, 100)
+        self.bake_all_progress.setVisible(False)
+        v6.addWidget(self.bake_all_progress)
+
         self.mesh_lbl = QLabel("—")
         v6.addWidget(self.mesh_lbl)
         vbox.addWidget(grp6)
@@ -635,6 +704,62 @@ class VoxelSausageTab(QWidget):
         self._set_status(f"Mesh baked — {len(verts)} verts, {len(faces)} faces.")
 
     # ------------------------------------------------------------------
+    # Step 6b: Bake All Frames → self._mesh_frames
+    # ------------------------------------------------------------------
+
+    def _bake_all_frames(self):
+        if self._carver is None:
+            self._set_status("Carve voxels first (Step 5).")
+            return
+        if self._skeleton_builder is None or self._skeleton_builder.poses is None:
+            self._set_status("Import a skeleton first (Step 1).")
+            return
+        n_frames = self._skeleton_builder.poses.shape[0]
+        world_res = self.bake_res_combo.currentData()
+
+        self.bake_all_progress.setVisible(True)
+        self.bake_all_progress.setValue(0)
+        self.btn_bake_all.setEnabled(False)
+
+        self._bake_worker = BakeAllWorker(self._carver, n_frames, world_res)
+        self._bake_thread = QThread(self)
+        self._bake_worker.moveToThread(self._bake_thread)
+        self._bake_thread.started.connect(self._bake_worker.run)
+        self._bake_worker.progress.connect(self._on_bake_all_progress)
+        self._bake_worker.finished.connect(self._on_bake_all_done)
+        self._bake_worker.error.connect(self._on_bake_all_error)
+        self._bake_thread.start()
+
+    def _on_bake_all_progress(self, done: int, total: int):
+        if total > 0:
+            self.bake_all_progress.setValue(int(100 * done / total))
+
+    def _on_bake_all_done(self, mesh_frames: np.ndarray, faces: np.ndarray):
+        if self._bake_thread is not None:
+            self._bake_thread.quit()
+        self.bake_all_progress.setVisible(False)
+        self.btn_bake_all.setEnabled(True)
+
+        self._mesh_frames = mesh_frames
+        self._mesh_verts  = mesh_frames[0]
+        self._mesh_faces  = faces
+        self._bone_weights = None   # world-space bake has no per-bone weights
+
+        self._clear_scatter()
+        self._mesh_viewer.set_mesh(self._mesh_verts, faces, None, 0)
+
+        n, v, f = int(mesh_frames.shape[0]), int(mesh_frames.shape[1]), int(len(faces))
+        self.mesh_lbl.setText(f"{n} frames × {v} verts, {f} faces")
+        self._set_status(f"Baked {n} frames, {v} verts, {f} faces.")
+
+    def _on_bake_all_error(self, msg: str):
+        if self._bake_thread is not None:
+            self._bake_thread.quit()
+        self.bake_all_progress.setVisible(False)
+        self.btn_bake_all.setEnabled(True)
+        self._set_status(f"Bake all error: {msg}")
+
+    # ------------------------------------------------------------------
     # Step 7: Save
     # ------------------------------------------------------------------
 
@@ -673,12 +798,19 @@ class VoxelSausageTab(QWidget):
             glb_path = os.path.join(save_dir, f"{name}_sausages.glb")
             try:
                 from pipeline.gltf_exporter import GLTFExporter
-                skel_seq = sb.poses[:, :33, :].astype(np.float32) if sb is not None else None
+                skel_seq = (sb.poses[:, :33, :].astype(np.float32)
+                            if sb is not None else None)
                 n_joints = 33
-                skin_w = np.zeros((len(self._mesh_verts), n_joints), dtype=np.float32)
-                for vi, jidx in enumerate(self._bone_weights):
-                    col = int(jidx) if int(jidx) < n_joints else 0
-                    skin_w[vi, col] = 1.0
+                if self._mesh_frames is not None:
+                    # World-space per-frame bake → morph targets, no bone weights
+                    skin_w = None
+                else:
+                    skin_w = np.zeros((len(self._mesh_verts), n_joints),
+                                      dtype=np.float32)
+                    if self._bone_weights is not None:
+                        for vi, jidx in enumerate(self._bone_weights):
+                            col = int(jidx) if int(jidx) < n_joints else 0
+                            skin_w[vi, col] = 1.0
                 exp = GLTFExporter()
                 exp.export_glb(
                     glb_path,
@@ -686,6 +818,7 @@ class VoxelSausageTab(QWidget):
                     self._mesh_faces.astype(np.int32),
                     skel_seq,
                     skinning_weights=skin_w,
+                    mesh_frames=self._mesh_frames,
                 )
             except Exception as exc:
                 _logger.warning("GLB save failed: %s", exc)

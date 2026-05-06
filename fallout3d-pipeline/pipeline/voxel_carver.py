@@ -336,6 +336,102 @@ class VoxelCarver:
 
     # ------------------------------------------------------------------
 
+    def world_bounds(self, n_frames: Optional[int] = None
+                     ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Bounding box of all bone capsules in world space across N frames.
+        Uses bone positions + radius (cheap, no voxel expansion needed).
+        Returns (lo, hi) as float64 (3,) arrays with a small margin.
+        """
+        poses = self.skeleton_builder.poses
+        if poses is None or not self.sausages:
+            return np.zeros(3, np.float64), np.ones(3, np.float64)
+        n = int(poses.shape[0]) if n_frames is None else min(n_frames, int(poses.shape[0]))
+
+        lo = np.full(3,  np.inf, np.float64)
+        hi = np.full(3, -np.inf, np.float64)
+        for f in range(n):
+            for s in self.sausages.values():
+                r = max(s.radius * 1.6, s.voxel_size * s.resolution * 0.5 + 0.01)
+                for pidx in (s.parent_idx, s.joint_idx):
+                    p = poses[f, pidx].astype(np.float64)
+                    lo = np.minimum(lo, p - r)
+                    hi = np.maximum(hi, p + r)
+        margin = max(float(np.max(hi - lo)) * 0.03, 0.02)
+        return (lo - margin).astype(np.float64), (hi + margin).astype(np.float64)
+
+    def bake_frame_world(
+        self,
+        frame_idx: int,
+        world_lo: np.ndarray,
+        world_hi: np.ndarray,
+        world_res: int = 64,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Rasterise all sausage voxels for one frame into a fixed world-space
+        grid, then run marching cubes.
+
+        The grid dims are determined by world_lo/hi + world_res — identical
+        across frames so topology is consistent.
+        Returns (verts float32 (V,3), faces int32 (F,3)) or (None, None).
+        """
+        try:
+            from skimage.measure import marching_cubes
+        except ImportError as exc:
+            raise ImportError("scikit-image required: pip install scikit-image") from exc
+
+        poses = self.skeleton_builder.poses
+        if poses is None or frame_idx >= poses.shape[0]:
+            return None, None
+
+        extent = (world_hi - world_lo).astype(np.float64)
+        voxel_size = float(np.max(extent)) / max(world_res - 1, 1)
+        if voxel_size < 1e-12:
+            return None, None
+
+        nx = max(int(np.ceil(extent[0] / voxel_size)) + 2, 4)
+        ny = max(int(np.ceil(extent[1] / voxel_size)) + 2, 4)
+        nz = max(int(np.ceil(extent[2] / voxel_size)) + 2, 4)
+        grid = np.zeros((nx, ny, nz), dtype=np.float32)
+
+        for s in self.sausages.values():
+            if s.voxels is None or not s.voxels.any():
+                continue
+            idx = np.argwhere(s.voxels)
+            if len(idx) == 0:
+                continue
+            local_pts = s.grid_origin + idx * s.voxel_size      # (M, 3)
+            head_w = poses[frame_idx, s.parent_idx]
+            tail_w = poses[frame_idx, s.joint_idx]
+            l2w, _ = BoneSausage._build_bone_matrix(head_w, tail_w)
+            M = len(local_pts)
+            pts_h = np.hstack([local_pts, np.ones((M, 1))])
+            world_pts = (l2w @ pts_h.T).T[:, :3]
+
+            gi = np.round((world_pts - world_lo) / voxel_size).astype(int)
+            valid = (np.all(gi >= 0, axis=1) &
+                     (gi[:, 0] < nx) & (gi[:, 1] < ny) & (gi[:, 2] < nz))
+            gi = gi[valid]
+            if len(gi) > 0:
+                grid[gi[:, 0], gi[:, 1], gi[:, 2]] = 1.0
+
+        if not grid.any():
+            return None, None
+
+        # Dilate by one voxel to close gaps between bones
+        from scipy.ndimage import binary_dilation
+        grid = binary_dilation(grid).astype(np.float32)
+
+        try:
+            vi, faces, _, _ = marching_cubes(grid, level=0.5)
+        except ValueError:
+            return None, None
+
+        verts_world = (world_lo + vi * voxel_size).astype(np.float32)
+        return verts_world, faces.astype(np.int32)
+
+    # ------------------------------------------------------------------
+
     def to_combined_mesh(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Concatenate all sausage meshes in world space (Frame-0 transform).
