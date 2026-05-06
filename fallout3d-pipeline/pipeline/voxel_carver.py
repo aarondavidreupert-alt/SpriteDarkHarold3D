@@ -21,7 +21,8 @@ from .skeleton_builder import BONE_HIERARCHY, BONE_NAMES
 _logger = logging.getLogger(__name__)
 
 # Joints too small / degenerate to carve usefully
-SKIP_JOINTS: frozenset = frozenset({0, 7, 8, 17, 18, 19, 20, 21, 22})
+SKIP_JOINTS: frozenset = frozenset({7, 8, 17, 18, 19, 20, 21, 22})
+_HEAD_JOINTS: frozenset = frozenset({0, 36})   # Nose + Head Top — get 2× base radius
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +223,19 @@ class BoneSausage:
     def occupied_count(self) -> int:
         return int(self.voxels.sum()) if self.voxels is not None else 0
 
+    def max_radial_distance(self) -> float:
+        """
+        Maximum distance of any surviving voxel centre from the bone axis
+        (local Z axis).  Equals sqrt(x² + y²) in local space.
+        Returns 0.0 if no voxels survive.
+        """
+        if self.voxels is None or not self.voxels.any():
+            return 0.0
+        idx = np.argwhere(self.voxels)                      # (M, 3)
+        pts = self.grid_origin + idx * self.voxel_size       # (M, 3)
+        radial = np.sqrt(pts[:, 0] ** 2 + pts[:, 1] ** 2)
+        return float(radial.max())
+
 
 # ---------------------------------------------------------------------------
 # VoxelCarver
@@ -266,7 +280,8 @@ class VoxelCarver:
             if bone_len < 0.01:
                 continue
 
-            radius  = self._bone_radii.get(joint_idx, base_r)
+            default = base_r * 2.0 if joint_idx in _HEAD_JOINTS else base_r
+            radius  = self._bone_radii.get(joint_idx, default)
             sausage = BoneSausage(joint_idx, parent_idx, radius, self.resolution)
             sausage._init_voxels(
                 np.zeros(3, dtype=np.float64),

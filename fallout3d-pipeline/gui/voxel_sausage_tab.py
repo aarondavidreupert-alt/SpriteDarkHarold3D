@@ -157,6 +157,20 @@ class VoxelSausageTab(QWidget):
         # ── Step 3: Adjust Radii ─────────────────────────────────────
         grp3 = QGroupBox("Step 3: Adjust Radii")
         v3   = QVBoxLayout(grp3)
+
+        row_all = QHBoxLayout()
+        row_all.addWidget(QLabel("Set all:"))
+        self._all_radius_spin = QDoubleSpinBox()
+        self._all_radius_spin.setRange(0.001, 0.5)
+        self._all_radius_spin.setSingleStep(0.005)
+        self._all_radius_spin.setDecimals(3)
+        self._all_radius_spin.setValue(0.045)
+        row_all.addWidget(self._all_radius_spin)
+        btn_set_all = QPushButton("Apply to All")
+        btn_set_all.clicked.connect(self._set_all_radii)
+        row_all.addWidget(btn_set_all)
+        v3.addLayout(row_all)
+
         self._radius_scroll = QScrollArea()
         self._radius_scroll.setWidgetResizable(True)
         self._radius_scroll.setFixedHeight(160)
@@ -409,6 +423,24 @@ class VoxelSausageTab(QWidget):
         self._show_voxel_cloud()
         self._set_status("Ragdoll rebuilt with updated radii.")
 
+    def _set_all_radii(self):
+        r = self._all_radius_spin.value()
+        for spin in self._radius_spins.values():
+            spin.setValue(r)
+
+    def _write_back_radii(self):
+        """Update radius spinboxes from max radial extent of carved voxels."""
+        if self._carver is None:
+            return
+        for jidx, sausage in self._carver.sausages.items():
+            r = sausage.max_radial_distance()
+            if r > 0.001 and jidx in self._radius_spins:
+                self._radius_spins[jidx].setValue(round(r, 4))
+        self._set_status(
+            "Radii updated from carved voxels — adjust if needed, "
+            "then click Rebuild + Carve for a tighter pass."
+        )
+
     # ------------------------------------------------------------------
     # Step 4: Play Animation
     # ------------------------------------------------------------------
@@ -555,6 +587,7 @@ class VoxelSausageTab(QWidget):
 
         self._clear_scatter()
         self._show_voxel_cloud()
+        self._write_back_radii()
 
     def _on_carve_error(self, msg: str):
         self._carve_thread.quit()

@@ -538,7 +538,7 @@ class MeshBuilderTab(QWidget):
         if char is None:
             return None
         if char.skeleton is not None and getattr(char.skeleton, "poses", None) is not None:
-            # SkeletonBuilder.poses is (N, 36, 3); slice to first 33 to match MediaPipe
+            # SkeletonBuilder.poses is (N, 37, 3); slice to first 33 to match MediaPipe
             return char.skeleton.poses[:, :33, :]
         return char.skeleton_3d
 

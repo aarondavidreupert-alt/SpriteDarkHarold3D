@@ -28,12 +28,14 @@ BONE_HIERARCHY: dict[int, int | None] = {
     18: 16, 20: 16, 22: 16,   # right fingers
     0: 33,                    # nose → hip root
     7: 0,  8: 0,              # ears
+    36: 0,                    # head top → nose
 }
 
 BONE_NAMES: dict[int, str] = {
     33: "Hip Root",
     34: "Spine Mid",
     35: "Chest",
+    36: "Head Top",
     23: "L-Hip",      24: "R-Hip",
     25: "L-Knee",     26: "R-Knee",
     27: "L-Ankle",    28: "R-Ankle",
@@ -304,18 +306,24 @@ class SkeletonBuilder:
     @staticmethod
     def _add_virtual_joints(skeleton_3d: np.ndarray) -> np.ndarray:
         """
-        Append virtual joints 33 (Hip Root), 34 (Spine Mid), 35 (Chest).
-        Returns (N, 36, 3).
+        Append virtual joints 33 (Hip Root), 34 (Spine Mid), 35 (Chest),
+        36 (Head Top).
+        Returns (N, 37, 3).
+        indices 0-32: MediaPipe, 33: Hip Root, 34: Spine Mid,
+        35: Chest, 36: Head Top.
         """
         hip_root  = (skeleton_3d[:, 23, :] + skeleton_3d[:, 24, :]) / 2.0
         chest     = (skeleton_3d[:, 11, :] + skeleton_3d[:, 12, :]) / 2.0
         spine_mid = (hip_root + chest) / 2.0
+        nose      = skeleton_3d[:, 0, :]
+        head_top  = nose + (nose - chest) * 0.18
         return np.concatenate([
             skeleton_3d,
             hip_root[:, np.newaxis, :],
             spine_mid[:, np.newaxis, :],
             chest[:, np.newaxis, :],
-        ], axis=1)  # (N, 36, 3)
+            head_top[:, np.newaxis, :],
+        ], axis=1)  # (N, 37, 3)
 
     def _measure_lengths(self, full: np.ndarray) -> dict[int, float]:
         """Compute median bone length for each joint across all frames."""
