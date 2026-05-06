@@ -600,7 +600,7 @@ class VoxelSausageTab(QWidget):
             return
         self._carver.reset()
         self._clear_scatter()
-        self._show_voxel_cloud()
+        self._show_voxel_cloud(frame_idx=self._current_frame)
         self._set_status("Voxels reset to initial capsule.")
 
     # ------------------------------------------------------------------

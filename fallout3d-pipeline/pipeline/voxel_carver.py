@@ -326,9 +326,6 @@ class VoxelCarver:
             self.carve_frame(f, masks_f, weighted=weighted)
             if progress_cb is not None:
                 progress_cb(f + 1, n)
-        if weighted:
-            for sausage in self.sausages.values():
-                sausage.finalise_weighted(n)
 
     # ------------------------------------------------------------------
 
