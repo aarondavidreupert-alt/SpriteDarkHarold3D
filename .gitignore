@@ -14,3 +14,4 @@ __pycache__/
 *.pyc
 /fallout3d-pipeline/pipeline/__pycache__
 *.pyc
+*.pyc
