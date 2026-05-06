@@ -451,6 +451,8 @@ class VoxelSausageTab(QWidget):
                 self._mesh_viewer.set_skeleton_overlay(skel[f], POSE_CONNECTIONS)
             except Exception:
                 pass
+            if self._carver is not None:
+                self._show_voxel_cloud(frame_idx=self._current_frame)
         self._update_sprite_strip(self._current_frame)
 
     # ------------------------------------------------------------------
@@ -669,8 +671,8 @@ class VoxelSausageTab(QWidget):
             pass
         self._scatter_items.clear()
 
-    def _show_voxel_cloud(self):
-        """Display occupied voxel centres as a coloured scatter plot."""
+    def _show_voxel_cloud(self, frame_idx: int = 0):
+        """Display occupied voxel centres at the given frame's bone poses."""
         if not _GL or self._carver is None:
             return
         self._clear_scatter()
@@ -678,6 +680,10 @@ class VoxelSausageTab(QWidget):
         poses = self._skeleton_builder.poses if self._skeleton_builder else None
         if poses is None or poses.shape[0] == 0:
             return
+
+        f = max(0, min(frame_idx, poses.shape[0] - 1))
+        animating = (f != 0)
+        cap = 1500 if (animating and len(self._carver.sausages) > 12) else 4000
 
         for ci, (jidx, sausage) in enumerate(self._carver.sausages.items()):
             if sausage.voxels is None or not sausage.voxels.any():
@@ -687,16 +693,15 @@ class VoxelSausageTab(QWidget):
                 continue
             local_pts = sausage.grid_origin + idx * sausage.voxel_size  # (M, 3)
 
-            head_w = poses[0, sausage.parent_idx]
-            tail_w = poses[0, sausage.joint_idx]
+            head_w = poses[f, sausage.parent_idx]
+            tail_w = poses[f, sausage.joint_idx]
             l2w, _ = BoneSausage._build_bone_matrix(head_w, tail_w)
             M = len(local_pts)
             world_pts = (l2w @ np.hstack([local_pts, np.ones((M, 1))]).T).T[:, :3]
 
-            # Subsample for performance
-            if len(world_pts) > 4000:
+            if len(world_pts) > cap:
                 rng = np.random.default_rng(jidx)
-                world_pts = world_pts[rng.choice(len(world_pts), 4000, replace=False)]
+                world_pts = world_pts[rng.choice(len(world_pts), cap, replace=False)]
 
             r, g, b = _BONE_COLOURS[ci % len(_BONE_COLOURS)]
             try:
