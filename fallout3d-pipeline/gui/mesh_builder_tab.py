@@ -65,6 +65,33 @@ class SausageWorker(QObject):
             self.error.emit(str(exc))
 
 
+class BakeAllWorker(QObject):
+    """Bake mesh verts for every frame using fit_to_skeleton()."""
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)        # mesh_frames (N, V, 3)
+    error    = pyqtSignal(str)
+
+    def __init__(self, fitter, skel: np.ndarray, rest_verts: np.ndarray):
+        super().__init__()
+        self._fitter = fitter
+        self._skel   = skel
+        self._rest   = rest_verts
+
+    def run(self):
+        try:
+            n = int(self._skel.shape[0])
+            frames = []
+            for f in range(n):
+                try:
+                    frames.append(self._fitter.fit_to_skeleton(self._skel[f]))
+                except Exception:
+                    frames.append(self._rest)
+                self.progress.emit(f + 1, n)
+            self.finished.emit(np.stack(frames, axis=0))
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class AOBakeWorker(QObject):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(object)   # ao array (V,)
@@ -208,6 +235,8 @@ class MeshBuilderTab(QWidget):
         self._ao_worker: AOBakeWorker | None = None
         self._sausage_thread: QThread | None = None
         self._sausage_worker: SausageWorker | None = None
+        self._bake_thread: QThread | None = None
+        self._bake_worker: BakeAllWorker | None = None
 
         self._build_ui()
 
@@ -284,6 +313,14 @@ class MeshBuilderTab(QWidget):
         self.fit_progress.setRange(0, 0)
         self.fit_progress.setVisible(False)
         v2.addWidget(self.fit_progress)
+
+        self.btn_bake_all = QPushButton("Bake All Frames")
+        self.btn_bake_all.clicked.connect(self._bake_all_frames)
+        v2.addWidget(self.btn_bake_all)
+        self.bake_all_progress = QProgressBar()
+        self.bake_all_progress.setRange(0, 100)
+        self.bake_all_progress.setVisible(False)
+        v2.addWidget(self.bake_all_progress)
         vbox.addWidget(grp2)
 
         # ── Step 3: Skinning Weights
@@ -652,6 +689,62 @@ class MeshBuilderTab(QWidget):
         self.fit_progress.setVisible(False)
         self.btn_fit.setEnabled(True)
         self._set_status(f"Fit error: {msg}")
+
+    # ------------------------------------------------------------------
+    # Step 2b: Bake All Frames → char.mesh_frames
+    # ------------------------------------------------------------------
+
+    def _bake_all_frames(self):
+        char = self.state.current_character
+        if char is None:
+            self._set_status("No character loaded.")
+            return
+        if (self._fitter is None or self._mesh_verts is None or
+                self._fitter.skinning_weights is None):
+            self._set_status("Fit a mesh first (Step 2).")
+            return
+        skel = self._animation_skeleton()
+        if skel is None or skel.shape[0] == 0:
+            self._set_status("No skeleton available.")
+            return
+
+        self.bake_all_progress.setVisible(True)
+        self.bake_all_progress.setValue(0)
+        self.btn_bake_all.setEnabled(False)
+
+        self._bake_worker = BakeAllWorker(self._fitter, skel, self._mesh_verts)
+        self._bake_thread = QThread(self)
+        self._bake_worker.moveToThread(self._bake_thread)
+        self._bake_thread.started.connect(self._bake_worker.run)
+        self._bake_worker.progress.connect(self._on_bake_all_progress)
+        self._bake_worker.finished.connect(self._on_bake_all_done)
+        self._bake_worker.error.connect(self._on_bake_all_error)
+        self._bake_thread.start()
+
+    def _on_bake_all_progress(self, done: int, total: int):
+        if total > 0:
+            self.bake_all_progress.setValue(int(100 * done / total))
+
+    def _on_bake_all_done(self, mesh_frames: np.ndarray):
+        if self._bake_thread is not None:
+            self._bake_thread.quit()
+        self.bake_all_progress.setVisible(False)
+        self.btn_bake_all.setEnabled(True)
+
+        char = self.state.current_character
+        if char is not None:
+            char.mesh_frames = mesh_frames
+            self.state.character_updated.emit(self.state.selected_idx)
+
+        n, v = int(mesh_frames.shape[0]), int(mesh_frames.shape[1])
+        self._set_status(f"Baked {n} frames, {v} verts each.")
+
+    def _on_bake_all_error(self, msg: str):
+        if self._bake_thread is not None:
+            self._bake_thread.quit()
+        self.bake_all_progress.setVisible(False)
+        self.btn_bake_all.setEnabled(True)
+        self._set_status(f"Bake all error: {msg}")
 
     # ------------------------------------------------------------------
     # Step 3: Skinning weights / bone display

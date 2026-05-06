@@ -46,6 +46,7 @@ class CharacterData:
     skeleton_3d: Optional[np.ndarray] = None    # (N, 33, 3)
     confidences: Optional[np.ndarray] = None    # (N, 33)
     mesh_verts: Optional[np.ndarray] = None     # (V, 3)  rest-pose
+    mesh_frames: Optional[np.ndarray] = None    # (N, V, 3) per-frame baked
     skinning_weights: Optional[np.ndarray] = None
     upscaled_frames: Optional[np.ndarray] = None    # (6, N, H', W', 3) after upscaling
     annotated_frames: Optional[np.ndarray] = None   # (6, N, H, W, 3) with MP overlay

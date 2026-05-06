@@ -60,6 +60,7 @@ class GLTFExporter:
         skinning_weights: Optional[np.ndarray] = None,  # (V, J)
         normal_maps: Optional[np.ndarray] = None,        # (6, N, H, W, 3)
         uvs: Optional[np.ndarray] = None,               # (V, 2)
+        mesh_frames: Optional[np.ndarray] = None,       # (N, V, 3) per-frame verts
     ):
         if not _PYGLTF_AVAILABLE:
             raise RuntimeError("pygltflib is not installed. Run: pip install pygltflib")
@@ -154,19 +155,44 @@ class GLTFExporter:
         mesh_node_idx = len(gltf.nodes)
         gltf.nodes.append(pygltflib.Node(name="Mesh", mesh=0, skin=skin_idx))
 
-        gltf.meshes.append(pygltflib.Mesh(
-            name="CritterMesh",
-            primitives=[pygltflib.Primitive(
-                attributes=pygltflib.Attributes(
-                    POSITION=pos_acc,
-                    NORMAL=norm_acc,
-                    TEXCOORD_0=uv_acc,
-                    **prim_extras,
-                ),
-                indices=idx_acc,
-                material=0,
-            )],
-        ))
+        primitive = pygltflib.Primitive(
+            attributes=pygltflib.Attributes(
+                POSITION=pos_acc,
+                NORMAL=norm_acc,
+                TEXCOORD_0=uv_acc,
+                **prim_extras,
+            ),
+            indices=idx_acc,
+            material=0,
+        )
+        mesh_obj = pygltflib.Mesh(name="CritterMesh", primitives=[primitive])
+        gltf.meshes.append(mesh_obj)
+
+        # ---- Morph targets (per-frame deformation) -----------------
+        morph_target_acc: list[int] = []
+        morph_n_targets = 0
+        morph_stride = 1
+        if mesh_frames is not None and len(mesh_frames) >= 2 and \
+                mesh_frames.shape[1] == len(vertices):
+            n_total = int(mesh_frames.shape[0])
+            morph_stride = max(1, (n_total + 254) // 255)
+            sel = mesh_frames[::morph_stride]
+            if len(sel) > 255:
+                sel = sel[:255]
+            rest = verts_f32
+            for i in range(len(sel)):
+                delta = (sel[i].astype(np.float32) - rest)
+                if not np.any(np.isfinite(delta)):
+                    delta = np.zeros_like(rest)
+                delta = np.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
+                acc = add_accessor(delta, pygltflib.FLOAT, pygltflib.VEC3,
+                                   target=pygltflib.ARRAY_BUFFER)
+                morph_target_acc.append(acc)
+            morph_n_targets = len(morph_target_acc)
+            primitive.targets = [
+                pygltflib.Attributes(POSITION=a) for a in morph_target_acc
+            ]
+            mesh_obj.weights = [0.0] * morph_n_targets
 
         gltf.materials.append(pygltflib.Material(
             name="CritterMaterial",
@@ -200,6 +226,25 @@ class GLTFExporter:
                     ),
                 ))
             gltf.animations.append(anim)
+
+        # ---- Morph weight animation --------------------------------
+        if morph_n_targets >= 2:
+            m_times = (np.arange(morph_n_targets, dtype=np.float32)
+                       * morph_stride / self.fps)
+            m_weights = np.eye(morph_n_targets, dtype=np.float32).flatten()
+            mtime_acc = add_accessor(m_times, pygltflib.FLOAT, pygltflib.SCALAR)
+            mwgt_acc  = add_accessor(m_weights, pygltflib.FLOAT, pygltflib.SCALAR)
+            anim_m = pygltflib.Animation(name="MorphAnim")
+            anim_m.samplers.append(pygltflib.AnimationSampler(
+                input=mtime_acc, output=mwgt_acc, interpolation="STEP"
+            ))
+            anim_m.channels.append(pygltflib.AnimationChannel(
+                sampler=0,
+                target=pygltflib.AnimationChannelTarget(
+                    node=mesh_node_idx, path="weights"
+                ),
+            ))
+            gltf.animations.append(anim_m)
 
         # ---- Scene -------------------------------------------------
         scene_nodes = [mesh_node_idx] + joint_nodes

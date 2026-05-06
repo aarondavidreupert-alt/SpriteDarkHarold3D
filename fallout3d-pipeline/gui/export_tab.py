@@ -59,6 +59,7 @@ class ExportWorker(QObject):
                     faces=_stub_faces(char.mesh_verts) if char.mesh_verts is not None else np.array([[0, 1, 2]], dtype=int),
                     skeleton_sequence=char.skeleton_3d,
                     skinning_weights=char.skinning_weights,
+                    mesh_frames=getattr(char, "mesh_frames", None),
                 )
                 exported.append(glb_path)
 
