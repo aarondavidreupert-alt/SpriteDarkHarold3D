@@ -157,6 +157,26 @@ class MeshViewer3D(QWidget):
         )
         self._view.addItem(self._skeleton_item)
 
+    def add_extra_item(self, item) -> None:
+        """Add any pyqtgraph GL item (scatter, line, etc.) to the view."""
+        if not _GL_AVAILABLE:
+            return
+        if not hasattr(self, "_extra_items"):
+            self._extra_items = []
+        self._view.addItem(item)
+        self._extra_items.append(item)
+
+    def clear_extra_items(self) -> None:
+        """Remove all items previously added via add_extra_item()."""
+        if not _GL_AVAILABLE or not hasattr(self, "_extra_items"):
+            return
+        for item in self._extra_items:
+            try:
+                self._view.removeItem(item)
+            except Exception:
+                pass
+        self._extra_items = []
+
 
 # -----------------------------------------------------------------------
 # Normal map image widget

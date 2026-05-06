@@ -663,13 +663,10 @@ class VoxelSausageTab(QWidget):
 
     def _clear_scatter(self):
         """Remove any voxel scatter items from the 3D viewer."""
-        if not _GL:
-            return
-        for item in self._scatter_items:
-            try:
-                self._mesh_viewer.removeItem(item)
-            except Exception:
-                pass
+        try:
+            self._mesh_viewer.clear_extra_items()
+        except Exception:
+            pass
         self._scatter_items.clear()
 
     def _show_voxel_cloud(self):
@@ -708,7 +705,7 @@ class VoxelSausageTab(QWidget):
                     color=(r, g, b, 0.8),
                     size=2.5,
                 )
-                self._mesh_viewer.addItem(scatter)
+                self._mesh_viewer.add_extra_item(scatter)
                 self._scatter_items.append(scatter)
             except Exception as exc:
                 _logger.debug("scatter plot failed for bone %d: %s", jidx, exc)
