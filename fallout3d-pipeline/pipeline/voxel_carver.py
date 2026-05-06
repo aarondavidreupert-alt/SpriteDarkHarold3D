@@ -1,12 +1,15 @@
 """
-Iterative 4D Visual Hull — Per-Bone Voxel Carving.
+Per-bone voxel sausage carver.
 
-Each BoneSausage owns a voxel grid initialised as a capsule in bone-local
-space.  For every animation frame, the bone's current world transform is
-used to project all occupied voxels into the 6 silhouette masks.  Voxels
-that fall outside the silhouette are permanently removed.  After all frames
-have been carved, each sausage's surviving voxels are baked to a triangle
-mesh via marching cubes.
+Each bone owns a 3-D boolean grid (NxNxN) initialised as a capsule in
+bone-local space.  For every frame the bone's world transform is applied to
+project all occupied voxels into the 6 silhouette masks; voxels that fall
+outside any silhouette are removed.  Voxels live in bone-local space
+permanently — "following the bone" is free because the bone matrix is
+recomputed fresh each frame.
+
+Weighted mode: keep a float32 hit-count grid.  After all frames, voxels with
+count >= threshold * n_frames are kept.  This tolerates brief occlusions.
 """
 
 import logging
@@ -17,8 +20,8 @@ from .skeleton_builder import BONE_HIERARCHY, BONE_NAMES
 
 _logger = logging.getLogger(__name__)
 
-# Joints too small/degenerate to carve usefully
-_SKIP_JOINTS = frozenset({0, 7, 8, 17, 18, 19, 20, 21, 22})
+# Joints too small / degenerate to carve usefully
+SKIP_JOINTS: frozenset = frozenset({0, 7, 8, 17, 18, 19, 20, 21, 22})
 
 
 # ---------------------------------------------------------------------------
@@ -26,19 +29,20 @@ _SKIP_JOINTS = frozenset({0, 7, 8, 17, 18, 19, 20, 21, 22})
 # ---------------------------------------------------------------------------
 
 class BoneSausage:
-    """Voxel grid (NxNxN) living in bone-local space."""
+    """NxNxN voxel grid in bone-local space."""
 
     def __init__(self, joint_idx: int, parent_idx: int, radius: float,
                  resolution: int = 32):
-        self.joint_idx  = joint_idx
-        self.parent_idx = parent_idx
-        self.radius     = radius
-        self.resolution = resolution
+        self.joint_idx   = joint_idx
+        self.parent_idx  = parent_idx
+        self.radius      = radius          # mutable — updated by user sliders
+        self.resolution  = resolution
 
-        self.voxels: np.ndarray = np.zeros((resolution, resolution, resolution),
-                                           dtype=bool)
-        self.grid_origin:  np.ndarray = np.zeros(3, dtype=np.float64)
-        self.voxel_size:   float = 1.0
+        self.voxels:     Optional[np.ndarray] = None   # bool  (N,N,N)
+        self.weights:    Optional[np.ndarray] = None   # float32 (N,N,N) — weighted mode
+        self.grid_origin: np.ndarray = np.zeros(3, dtype=np.float64)
+        self.voxel_size:  float = 1.0
+        self._bone_len_f0: float = 0.0  # stored for reset()
 
         self.verts_local: Optional[np.ndarray] = None
         self.faces:       Optional[np.ndarray] = None
@@ -46,41 +50,41 @@ class BoneSausage:
     # ------------------------------------------------------------------
 
     def _init_voxels(self, head_local: np.ndarray, tail_local: np.ndarray):
-        """Initialise voxels as a capsule in bone-local space."""
+        """
+        Grid spans:
+          X, Y: [-radius*1.5 .. radius*1.5]
+          Z:    [-radius*0.5 .. bone_length + radius*0.5]
+        Capsule init is fully vectorised (no Python loop over voxels).
+        """
         r = self.radius
         N = self.resolution
-
-        # In bone-local space, head is at origin and tail is along +Z
         bone_len = float(np.linalg.norm(tail_local - head_local))
+        self._bone_len_f0 = bone_len
 
-        # Grid extents
-        x_min, x_max = -r * 1.5,  r * 1.5
-        y_min, y_max = -r * 1.5,  r * 1.5
-        z_min, z_max = -r * 0.5,  bone_len + r * 0.5
+        x_min, x_max = -r * 1.5, r * 1.5
+        y_min, y_max = -r * 1.5, r * 1.5
+        z_min, z_max = -r * 0.5, bone_len + r * 0.5
 
-        # voxel_size is uniform
         extent = max(x_max - x_min, y_max - y_min, z_max - z_min)
-        voxel_size = extent / N
-        self.voxel_size = voxel_size
+        voxel_size = extent / max(N - 1, 1)
+        self.voxel_size  = voxel_size
         self.grid_origin = np.array([x_min, y_min, z_min], dtype=np.float64)
 
-        # Voxel centre coordinates in local space: (N,N,N,3)
+        # Voxel centres  (N,N,N,3)
         ii = np.arange(N)
-        gx, gy, gz = np.meshgrid(ii, ii, ii, indexing="ij")
-        centres = (self.grid_origin +
-                   np.stack([gx, gy, gz], axis=-1) * voxel_size)  # (N,N,N,3)
-        pts = centres.reshape(-1, 3)  # (M, 3)
+        gi, gj, gk = np.meshgrid(ii, ii, ii, indexing="ij")
+        centres = self.grid_origin + np.stack([gi, gj, gk], axis=-1) * voxel_size
+        pts = centres.reshape(-1, 3)
 
-        # Capsule signed-distance: distance to the segment [head_local, tail_local]
-        seg = tail_local - head_local  # (3,) along Z
-        seg_len = float(np.linalg.norm(seg)) + 1e-12
-        seg_unit = seg / seg_len
-        # Project pts onto the segment
+        # Capsule SDF
+        seg_len = float(np.linalg.norm(tail_local - head_local)) + 1e-12
+        seg_unit = (tail_local - head_local) / seg_len
         t = np.clip(np.dot(pts - head_local, seg_unit), 0.0, seg_len)
-        closest = head_local + np.outer(t, seg_unit)  # (M,3)
-        dist = np.linalg.norm(pts - closest, axis=-1)  # (M,)
+        closest = head_local + np.outer(t, seg_unit)
+        dist = np.linalg.norm(pts - closest, axis=-1)
 
-        self.voxels = (dist <= r).reshape(N, N, N)
+        self.voxels  = (dist <= r).reshape(N, N, N)
+        self.weights = None
 
     # ------------------------------------------------------------------
 
@@ -88,23 +92,19 @@ class BoneSausage:
     def _build_bone_matrix(head_world: np.ndarray,
                            tail_world: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Return (local_to_world (4,4), world_to_local (4,4)).
-        Local frame: origin at head_world, Z along bone direction.
+        Return (local→world 4×4, world→local 4×4).
+        Origin at head_world, local-Z along bone axis.
         """
         z = tail_world - head_world
         z_len = np.linalg.norm(z)
-        if z_len < 1e-12:
-            z = np.array([0.0, 0.0, 1.0])
-        else:
-            z = z / z_len
+        z = (z / z_len) if z_len > 1e-12 else np.array([0., 0., 1.])
 
-        # Gram-Schmidt: pick up = [0,0,1], fall back to [1,0,0] if Z is vertical
-        up = np.array([0.0, 0.0, 1.0])
+        up = np.array([0., 0., 1.])
         if abs(np.dot(z, up)) > 0.99:
-            up = np.array([1.0, 0.0, 0.0])
+            up = np.array([1., 0., 0.])
         x = up - np.dot(up, z) * z
         x /= np.linalg.norm(x) + 1e-12
-        y = np.cross(z, x)
+        y  = np.cross(z, x)
         y /= np.linalg.norm(y) + 1e-12
 
         l2w = np.eye(4, dtype=np.float64)
@@ -113,97 +113,114 @@ class BoneSausage:
         l2w[:3, 2] = z
         l2w[:3, 3] = head_world
 
-        w2l = np.linalg.inv(l2w)
-        return l2w, w2l
+        return l2w, np.linalg.inv(l2w)
 
     # ------------------------------------------------------------------
 
     def carve_frame(self, head_world: np.ndarray, tail_world: np.ndarray,
-                    silhouette_masks, camera_setup):
+                    silhouette_masks, camera_setup, weighted: bool = False):
         """
-        Remove voxels that fall outside any silhouette in this frame.
+        Fully vectorised carve (no Python loop over voxels).
 
-        silhouette_masks: list of 6 (H, W) binary arrays.
-        camera_setup: IsometricCameraSetup with .camera_views and .image_size.
+        Boolean mode  — voxels outside any camera's silhouette → cleared.
+        Weighted mode — voxels inside ALL cameras' silhouettes → weights++.
         """
-        if not self.voxels.any():
+        if self.voxels is None or not self.voxels.any():
             return
 
-        l2w, _w2l = self._build_bone_matrix(head_world, tail_world)
+        l2w, _ = self._build_bone_matrix(head_world, tail_world)
 
-        # Enumerate occupied voxel centres in local space
-        idx = np.argwhere(self.voxels)              # (M, 3) int indices
-        if len(idx) == 0:
+        active_idx = np.argwhere(self.voxels)    # (M, 3)
+        if len(active_idx) == 0:
             return
-        local_pts = self.grid_origin + idx * self.voxel_size  # (M, 3)
 
-        # Transform to world space
+        local_pts = self.grid_origin + active_idx * self.voxel_size  # (M, 3)
         M = len(local_pts)
-        local_h = np.hstack([local_pts, np.ones((M, 1))])  # (M, 4)
-        world_pts = (l2w @ local_h.T).T[:, :3]              # (M, 3)
+        world_pts = (l2w @ np.hstack([local_pts, np.ones((M, 1))]).T).T[:, :3]
 
         W_img, H_img = camera_setup.image_size
-        pts_h = np.hstack([world_pts, np.ones((M, 1))])     # (M, 4)
+        pts_h = np.hstack([world_pts, np.ones((M, 1))])   # (M, 4)
 
-        # Accumulate "survive" mask: a voxel survives if it's inside EVERY
-        # direction's silhouette (or out of bounds — treat as silhouette)
-        carve = np.zeros(M, dtype=bool)
+        if weighted:
+            if self.weights is None:
+                self.weights = np.zeros(self.voxels.shape, dtype=np.float32)
+            # A voxel is counted if inside ALL cameras' silhouettes.
+            # Out-of-bounds voxels get benefit of the doubt (treated as inside).
+            all_inside = np.ones(M, dtype=bool)
+            for d, view in enumerate(camera_setup.camera_views):
+                P   = view["projection"]
+                p2h = (P @ pts_h.T).T
+                w_c = p2h[:, 2]
+                safe = np.abs(w_c) > 1e-12
+                px = np.where(safe, p2h[:, 0] / np.where(safe, w_c, 1.), -1.)
+                py = np.where(safe, p2h[:, 1] / np.where(safe, w_c, 1.), -1.)
+                in_b = safe & (px >= 0) & (px < W_img) & (py >= 0) & (py < H_img)
+                ipx  = np.clip(px.astype(int), 0, W_img - 1)
+                ipy  = np.clip(py.astype(int), 0, H_img - 1)
+                hit  = silhouette_masks[d][ipy, ipx].astype(bool)
+                # Not inside this camera = in-bounds AND outside mask
+                all_inside &= ~in_b | hit
+            self.weights[active_idx[all_inside, 0],
+                         active_idx[all_inside, 1],
+                         active_idx[all_inside, 2]] += 1.0
+        else:
+            carve = np.zeros(M, dtype=bool)
+            for d, view in enumerate(camera_setup.camera_views):
+                P   = view["projection"]
+                p2h = (P @ pts_h.T).T
+                w_c = p2h[:, 2]
+                safe = np.abs(w_c) > 1e-12
+                px = np.where(safe, p2h[:, 0] / np.where(safe, w_c, 1.), -1.)
+                py = np.where(safe, p2h[:, 1] / np.where(safe, w_c, 1.), -1.)
+                in_b = safe & (px >= 0) & (px < W_img) & (py >= 0) & (py < H_img)
+                ipx  = np.clip(px.astype(int), 0, W_img - 1)
+                ipy  = np.clip(py.astype(int), 0, H_img - 1)
+                hit  = silhouette_masks[d][ipy, ipx].astype(bool)
+                carve |= in_b & ~hit
+                if not self.voxels.any():
+                    break
+            if carve.any():
+                self.voxels[active_idx[carve, 0],
+                             active_idx[carve, 1],
+                             active_idx[carve, 2]] = False
 
-        for d, view in enumerate(camera_setup.camera_views):
-            P = view["projection"]                  # (3, 4)
-            p2h = (P @ pts_h.T).T                  # (M, 3)
-            w_coord = p2h[:, 2]
-            safe = np.abs(w_coord) > 1e-12
-            px = np.full(M, -1.0)
-            py = np.full(M, -1.0)
-            px[safe] = p2h[safe, 0] / w_coord[safe]
-            py[safe] = p2h[safe, 1] / w_coord[safe]
+    # ------------------------------------------------------------------
 
-            in_bounds = (safe &
-                         (px >= 0) & (px < W_img) &
-                         (py >= 0) & (py < H_img))
-
-            mask_d = silhouette_masks[d]            # (H, W) binary
-            ipx = np.clip(px.astype(int), 0, W_img - 1)
-            ipy = np.clip(py.astype(int), 0, H_img - 1)
-            hit = mask_d[ipy, ipx].astype(bool)    # (M,)
-
-            # Carve if in-bounds AND outside silhouette
-            carve |= in_bounds & ~hit
-
-            if not self.voxels.any():
-                break
-
-        if carve.any():
-            self.voxels[idx[carve, 0], idx[carve, 1], idx[carve, 2]] = False
+    def finalise_weighted(self, n_frames: int, threshold: float = 0.3):
+        """Convert accumulated hit-counts to boolean voxels."""
+        if self.weights is None:
+            return
+        self.voxels  = self.weights >= (threshold * max(n_frames, 1))
+        self.weights = None
 
     # ------------------------------------------------------------------
 
     def bake_mesh(self):
-        """Run marching cubes on the surviving voxels."""
+        """Run marching cubes; store verts_local and faces."""
         try:
             from skimage.measure import marching_cubes
         except ImportError as exc:
-            raise ImportError(
-                "scikit-image is required for bake_mesh — "
-                "pip install scikit-image"
-            ) from exc
+            raise ImportError("scikit-image required: pip install scikit-image") from exc
 
-        if not self.voxels.any():
+        if self.voxels is None or not self.voxels.any():
             self.verts_local = np.zeros((0, 3), dtype=np.float64)
-            self.faces = np.zeros((0, 3), dtype=np.int32)
+            self.faces       = np.zeros((0, 3), dtype=np.int32)
             return
 
-        vol = self.voxels.astype(np.float32)
         try:
-            verts_idx, faces, _, _ = marching_cubes(vol, level=0.5)
+            vi, faces, _, _ = marching_cubes(self.voxels.astype(np.float32), level=0.5)
         except ValueError:
             self.verts_local = np.zeros((0, 3), dtype=np.float64)
-            self.faces = np.zeros((0, 3), dtype=np.int32)
+            self.faces       = np.zeros((0, 3), dtype=np.int32)
             return
 
-        self.verts_local = self.grid_origin + verts_idx * self.voxel_size
-        self.faces = faces.astype(np.int32)
+        self.verts_local = self.grid_origin + vi * self.voxel_size
+        self.faces       = faces.astype(np.int32)
+
+    # ------------------------------------------------------------------
+
+    def occupied_count(self) -> int:
+        return int(self.voxels.sum()) if self.voxels is not None else 0
 
 
 # ---------------------------------------------------------------------------
@@ -211,98 +228,194 @@ class BoneSausage:
 # ---------------------------------------------------------------------------
 
 class VoxelCarver:
-    """
-    Build one BoneSausage per skeletal bone, carve all frames, bake meshes.
-    """
+    """Build one BoneSausage per skeletal bone, carve frames, bake meshes."""
 
-    def __init__(self, skeleton_builder, camera_setup, resolution: int = 32):
+    def __init__(self, skeleton_builder, camera_setup,
+                 bone_radii: Optional[Dict[int, float]] = None,
+                 resolution: int = 32):
         self.skeleton_builder = skeleton_builder
         self.camera_setup     = camera_setup
         self.resolution       = resolution
-        self.sausages: List[BoneSausage] = []
-
+        self._bone_radii      = bone_radii or {}
+        self.sausages: Dict[int, BoneSausage] = {}
         self._build_sausages()
 
     # ------------------------------------------------------------------
 
     def _build_sausages(self):
-        sb = self.skeleton_builder
+        sb    = self.skeleton_builder
         poses = sb.poses
         if poses is None or poses.shape[0] == 0:
             return
 
-        pose0 = poses[0]  # (36, 3) world-space joints at frame 0
-
-        # Compute body height from frame 0 for radius estimation
-        nose  = pose0[0] if pose0.shape[0] > 0 else pose0[0]
-        feet_mid = (pose0[27] + pose0[28]) * 0.5 if pose0.shape[0] > 28 else pose0[0]
+        pose0 = poses[0]
+        feet_mid    = (pose0[27] + pose0[28]) * 0.5 if pose0.shape[0] > 28 else pose0[0]
         body_height = float(np.linalg.norm(pose0[0] - feet_mid))
         if body_height < 1e-6:
             body_height = 1.0
         base_r = body_height * 0.045
 
         for joint_idx, parent_idx in BONE_HIERARCHY.items():
-            if parent_idx is None:
-                continue  # skip root (no parent → no bone)
-            if joint_idx in _SKIP_JOINTS:
+            if parent_idx is None or joint_idx in SKIP_JOINTS:
                 continue
-
             if joint_idx >= pose0.shape[0] or parent_idx >= pose0.shape[0]:
                 continue
-
-            head_world = pose0[parent_idx]
-            tail_world = pose0[joint_idx]
-            bone_len = float(np.linalg.norm(tail_world - head_world))
+            head_w   = pose0[parent_idx]
+            tail_w   = pose0[joint_idx]
+            bone_len = float(np.linalg.norm(tail_w - head_w))
             if bone_len < 0.01:
-                _logger.debug("Skipping joint %d — bone too short (%.4f)", joint_idx, bone_len)
                 continue
 
-            sausage = BoneSausage(joint_idx, parent_idx, base_r, self.resolution)
+            radius  = self._bone_radii.get(joint_idx, base_r)
+            sausage = BoneSausage(joint_idx, parent_idx, radius, self.resolution)
+            sausage._init_voxels(
+                np.zeros(3, dtype=np.float64),
+                np.array([0., 0., bone_len], dtype=np.float64),
+            )
+            self.sausages[joint_idx] = sausage
 
-            # In bone-local space the head is at origin, tail is along +Z
-            head_local = np.zeros(3, dtype=np.float64)
-            tail_local = np.array([0.0, 0.0, bone_len], dtype=np.float64)
-            sausage._init_voxels(head_local, tail_local)
-
-            self.sausages.append(sausage)
-
-        _logger.info("VoxelCarver: %d sausages initialised at res=%d",
-                     len(self.sausages), self.resolution)
+        _logger.info("VoxelCarver: %d sausages at res=%d", len(self.sausages), self.resolution)
 
     # ------------------------------------------------------------------
 
-    def carve_all(self, all_silhouette_masks):
-        """
-        Carve all frames.
+    def reset(self):
+        """Re-initialise all voxel grids from Frame-0 (keeps current radii)."""
+        for sausage in self.sausages.values():
+            sausage._init_voxels(
+                np.zeros(3, dtype=np.float64),
+                np.array([0., 0., sausage._bone_len_f0], dtype=np.float64),
+            )
 
-        all_silhouette_masks: list of F entries, each a list of 6 (H,W) arrays.
-        """
-        sb  = self.skeleton_builder
-        poses = sb.poses
-        if poses is None:
+    # ------------------------------------------------------------------
+
+    def carve_frame(self, frame_idx: int, silhouette_masks,
+                    weighted: bool = False):
+        """Carve a single animation frame for all sausages."""
+        poses = self.skeleton_builder.poses
+        if poses is None or frame_idx >= poses.shape[0]:
             return
+        for sausage in self.sausages.values():
+            head_w = poses[frame_idx, sausage.parent_idx]
+            tail_w = poses[frame_idx, sausage.joint_idx]
+            sausage.carve_frame(head_w, tail_w, silhouette_masks,
+                                self.camera_setup, weighted=weighted)
 
-        N = poses.shape[0]
-        for f in range(N):
-            masks_f = all_silhouette_masks[f]
-            for sausage in self.sausages:
-                head_w = poses[f, sausage.parent_idx]
-                tail_w = poses[f, sausage.joint_idx]
-                sausage.carve_frame(head_w, tail_w, masks_f, self.camera_setup)
-            if f % 10 == 0:
-                _logger.info("VoxelCarver: carved frame %d/%d", f + 1, N)
+    def carve_all_frames(self, all_masks, weighted: bool = False,
+                         progress_cb=None):
+        """
+        all_masks: list[F] of list[6] of (H,W) uint8 arrays.
+        progress_cb(done, total) called after each frame.
+        """
+        n = len(all_masks)
+        for f, masks_f in enumerate(all_masks):
+            self.carve_frame(f, masks_f, weighted=weighted)
+            if progress_cb is not None:
+                progress_cb(f + 1, n)
+        if weighted:
+            for sausage in self.sausages.values():
+                sausage.finalise_weighted(n)
 
-        _logger.info("VoxelCarver: baking meshes …")
-        for sausage in self.sausages:
+    # ------------------------------------------------------------------
+
+    def bake_all(self):
+        """Run marching cubes on every sausage that has surviving voxels."""
+        for sausage in self.sausages.values():
             sausage.bake_mesh()
-        _logger.info("VoxelCarver: done")
+
+    # ------------------------------------------------------------------
+
+    def to_combined_mesh(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Concatenate all sausage meshes in world space (Frame-0 transform).
+        Returns (verts_world float32 (V,3), faces int32 (F,3),
+                 bone_weights int32 (V,) — joint_idx per vertex).
+        """
+        poses = self.skeleton_builder.poses
+        _empty = (np.zeros((0, 3), np.float32),
+                  np.zeros((0, 3), np.int32),
+                  np.zeros(0, np.int32))
+        if poses is None:
+            return _empty
+
+        all_v, all_f, all_bw = [], [], []
+        offset = 0
+        for jidx, s in self.sausages.items():
+            if s.verts_local is None or len(s.verts_local) == 0:
+                continue
+            head_w = poses[0, s.parent_idx]
+            tail_w = poses[0, s.joint_idx]
+            l2w, _ = BoneSausage._build_bone_matrix(head_w, tail_w)
+            M = len(s.verts_local)
+            lh = np.hstack([s.verts_local, np.ones((M, 1))])
+            all_v.append((l2w @ lh.T).T[:, :3].astype(np.float32))
+            all_f.append(s.faces + offset)
+            all_bw.append(np.full(M, jidx, dtype=np.int32))
+            offset += M
+
+        if not all_v:
+            return _empty
+        return (np.concatenate(all_v),
+                np.concatenate(all_f).astype(np.int32),
+                np.concatenate(all_bw))
+
+    # ------------------------------------------------------------------
+
+    def save(self, path: str):
+        """Save voxels + metadata to compressed .npz."""
+        data: Dict[str, np.ndarray] = {}
+        sl = list(self.sausages.values())
+        data["n_sausages"] = np.array(len(sl), dtype=np.int32)
+        for i, s in enumerate(sl):
+            p = f"s{i}_"
+            data[p + "joint_idx"]  = np.array(s.joint_idx,   np.int32)
+            data[p + "parent_idx"] = np.array(s.parent_idx,  np.int32)
+            data[p + "radius"]     = np.array(s.radius,       np.float64)
+            data[p + "resolution"] = np.array(s.resolution,  np.int32)
+            data[p + "bone_len"]   = np.array(s._bone_len_f0, np.float64)
+            data[p + "grid_origin"]= s.grid_origin
+            data[p + "voxel_size"] = np.array(s.voxel_size,  np.float64)
+            if s.voxels is not None:
+                data[p + "voxels"] = s.voxels
+        if self.skeleton_builder.poses is not None:
+            data["skeleton_poses"] = self.skeleton_builder.poses
+        np.savez_compressed(path, **data)
+        _logger.info("VoxelCarver saved to %s", path)
+
+    @classmethod
+    def load(cls, path: str, skeleton_builder, camera_setup) -> "VoxelCarver":
+        """Restore from .npz."""
+        d   = np.load(path, allow_pickle=False)
+        n   = int(d["n_sausages"])
+        obj = cls.__new__(cls)
+        obj.skeleton_builder = skeleton_builder
+        obj.camera_setup     = camera_setup
+        obj.sausages         = {}
+        obj.resolution       = 32
+        obj._bone_radii      = {}
+        for i in range(n):
+            p    = f"s{i}_"
+            jidx = int(d[p + "joint_idx"])
+            pidx = int(d[p + "parent_idx"])
+            r    = float(d[p + "radius"])
+            res  = int(d[p + "resolution"])
+            obj.resolution = res
+            s = BoneSausage(jidx, pidx, r, res)
+            s._bone_len_f0 = float(d[p + "bone_len"])
+            s.grid_origin  = d[p + "grid_origin"].copy()
+            s.voxel_size   = float(d[p + "voxel_size"])
+            key = p + "voxels"
+            if key in d:
+                s.voxels = d[key].astype(bool)
+            obj.sausages[jidx] = s
+        _logger.info("VoxelCarver loaded from %s (%d sausages)", path, n)
+        return obj
 
     # ------------------------------------------------------------------
 
     def to_glb_meshes(self) -> List[Dict]:
-        """Return one dict per sausage with verts/faces in bone-local space."""
+        """Compatibility helper (used by MeshFitter.carve_voxel_sausages)."""
         result = []
-        for s in self.sausages:
+        for s in self.sausages.values():
             if s.verts_local is None or len(s.verts_local) == 0:
                 continue
             result.append({

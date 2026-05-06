@@ -150,7 +150,7 @@ class MainWindow(QMainWindow):
         from gui.pose_library_tab import PoseLibraryTab
         from gui.mesh_tab import MeshTab
         from gui.mesh_builder_tab import MeshBuilderTab
-        from gui.mesh_template_tab import MeshTemplateTab
+        from gui.voxel_sausage_tab import VoxelSausageTab
         from gui.export_tab import ExportTab
 
         self.tabs = QTabWidget()
@@ -167,7 +167,7 @@ class MainWindow(QMainWindow):
         self.tab_library          = PoseLibraryTab(self.state, self)
         self.tab_mesh             = MeshTab(self.state, self)
         self.tab_mesh_builder     = MeshBuilderTab(self.state, self)
-        self.tab_mesh_template    = MeshTemplateTab(self.state, self)
+        self.tab_voxel_sausage    = VoxelSausageTab(self.state, self)
         self.tab_export           = ExportTab(self.state, self)
 
         self.tabs.addTab(self.tab_asset,            "1 · Asset Loader")
@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_library,          "6 · Pose Library")
         self.tabs.addTab(self.tab_mesh,             "7 · Mesh & Normals")
         self.tabs.addTab(self.tab_mesh_builder,     "7b · Mesh Builder")
-        self.tabs.addTab(self.tab_mesh_template,    "7c · Mesh Template")
+        self.tabs.addTab(self.tab_voxel_sausage,   "7c · Voxel Sausage")
         self.tabs.addTab(self.tab_export,           "8 · Export")
 
         # Auto-build skeleton after triangulation completes
@@ -312,7 +312,7 @@ class MainWindow(QMainWindow):
     _TAB_LIBRARY        = 7
     _TAB_MESH           = 8
     _TAB_MESH_BUILDER   = 9
-    _TAB_MESH_TEMPLATE  = 10
+    _TAB_VOXEL_SAUSAGE  = 10
     _TAB_EXPORT         = 11
 
     def run_pipeline_until(self, target: int):
