@@ -340,19 +340,16 @@ class VoxelCarver:
         self,
         resolution: int = 64,
         progress_cb=None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> List[Tuple[Optional[np.ndarray], Optional[np.ndarray]]]:
         """
-        Bake per-frame meshes through a single fixed world-space grid.
+        Bake per-frame meshes independently through a single fixed world-space grid.
 
-        Stable topology across frames is achieved by:
-          * computing the bounding box from ALL transformed voxel points,
-          * cubic voxels (same voxel_size on all 3 axes),
-          * a single grid_shape used for every frame.
+        The bbox and cubic voxel_size are computed once over all frames so the
+        grid_shape is identical every frame.  Each frame's marching-cubes result
+        is returned as-is — no vertex-count comparison, no fallback.
 
-        Frames whose marching-cubes vertex count differs from frame 0 fall
-        back to the frame-0 mesh (a warning is logged).
-
-        Returns (mesh_frames float32 (N, V, 3), faces int32 (F, 3)).
+        Returns list[N] of (verts float32 (V,3), faces int32 (F,3)).
+        Frames that produce no surface return (None, None).
         """
         try:
             from skimage.measure import marching_cubes
@@ -360,12 +357,11 @@ class VoxelCarver:
             raise ImportError("scikit-image required: pip install scikit-image") from exc
 
         poses = self.skeleton_builder.poses
-        empty = (np.zeros((0, 0, 3), np.float32), np.zeros((0, 3), np.int32))
         if poses is None or poses.shape[0] == 0 or not self.sausages:
-            return empty
+            return []
         n_frames = int(poses.shape[0])
 
-        # ── Step 1: collect transformed voxel points + bbox over all frames ──
+        # ── Step 1: transform voxel points to world space, accumulate bbox ──
         per_frame_points: list[list[np.ndarray]] = []
         bbox_min = np.full(3,  np.inf, np.float64)
         bbox_max = np.full(3, -np.inf, np.float64)
@@ -389,12 +385,12 @@ class VoxelCarver:
             per_frame_points.append(frame_pts)
 
         if not np.all(np.isfinite(bbox_min)):
-            return empty
+            return []
 
-        # ── Step 2: fixed cubic grid ──────────────────────────────────────
+        # ── Step 2: fixed cubic grid (same shape every frame) ────────────
         voxel_size = float((bbox_max - bbox_min).max()) / max(resolution - 1, 1)
         if voxel_size < 1e-12:
-            return empty
+            return []
         pad = 2.0 * voxel_size
         grid_lo = bbox_min - pad
         grid_hi = bbox_max + pad
@@ -412,47 +408,25 @@ class VoxelCarver:
                     grid[gi[:, 0], gi[:, 1], gi[:, 2]] = True
             return grid
 
-        # ── Step 3: marching cubes per frame ─────────────────────────────
-        grid0 = _rasterise(per_frame_points[0]).astype(np.float32)
-        if not grid0.any():
-            return empty
-        try:
-            v0, faces_ref, _, _ = marching_cubes(grid0, level=0.5)
-        except ValueError:
-            return empty
-        V = int(len(v0))
-        rest_world = (v0 * voxel_size + grid_lo).astype(np.float32)
-        mesh_frames: list[np.ndarray] = [rest_world]
-        if progress_cb is not None:
-            progress_cb(1, n_frames)
-
-        mismatches = 0
-        for f in range(1, n_frames):
+        # ── Step 3: independent marching cubes per frame ─────────────────
+        results: list[tuple[Optional[np.ndarray], Optional[np.ndarray]]] = []
+        for f in range(n_frames):
             grid_f = _rasterise(per_frame_points[f]).astype(np.float32)
-            verts_world = None
+            entry: tuple[Optional[np.ndarray], Optional[np.ndarray]] = (None, None)
             if grid_f.any():
                 try:
-                    vf, _, _, _ = marching_cubes(grid_f, level=0.5)
-                    if len(vf) == V:
-                        verts_world = (vf * voxel_size + grid_lo).astype(np.float32)
-                    else:
-                        _logger.warning(
-                            "bake_world_grid frame %d: %d verts ≠ %d (rest pose)",
-                            f, len(vf), V)
+                    vf, ff, _, _ = marching_cubes(grid_f, level=0.5)
+                    entry = (
+                        (vf * voxel_size + grid_lo).astype(np.float32),
+                        ff.astype(np.int32),
+                    )
                 except ValueError:
                     pass
-            if verts_world is None:
-                verts_world = rest_world
-                mismatches += 1
-            mesh_frames.append(verts_world)
+            results.append(entry)
             if progress_cb is not None:
                 progress_cb(f + 1, n_frames)
 
-        if mismatches:
-            _logger.info("bake_world_grid: %d/%d frames fell back to rest pose",
-                         mismatches, n_frames)
-
-        return np.stack(mesh_frames, axis=0), faces_ref.astype(np.int32)
+        return results
 
     # ------------------------------------------------------------------
 

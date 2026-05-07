@@ -55,7 +55,7 @@ _BONE_COLOURS = [
 class BakeAllWorker(QObject):
     """Bake per-frame world-space mesh in a background thread."""
     progress = pyqtSignal(int, int)
-    finished = pyqtSignal(object, object)  # (mesh_frames (N,V,3), faces (F,3))
+    finished = pyqtSignal(object)   # list of (verts, faces) per frame
     error    = pyqtSignal(str)
 
     def __init__(self, carver: VoxelCarver, world_res: int = 64):
@@ -65,14 +65,14 @@ class BakeAllWorker(QObject):
 
     def run(self):
         try:
-            mesh_frames, faces = self._carver.bake_world_grid(
+            results = self._carver.bake_world_grid(
                 resolution=self._world_res,
                 progress_cb=lambda d, t: self.progress.emit(d, t),
             )
-            if mesh_frames.size == 0 or len(faces) == 0:
+            if not results or all(v is None for v, _ in results):
                 self.error.emit("Bake produced no mesh — carve voxels first.")
                 return
-            self.finished.emit(mesh_frames, faces)
+            self.finished.emit(results)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -115,7 +115,7 @@ class VoxelSausageTab(QWidget):
         self._current_frame = 0
         self._mesh_verts: np.ndarray | None = None
         self._mesh_faces: np.ndarray | None = None
-        self._mesh_frames: np.ndarray | None = None  # (N, V, 3) from Bake All Frames
+        self._mesh_frames: list | None = None   # list of (verts, faces) per frame
         self._bone_weights: np.ndarray | None = None
         self._scatter_items: list = []       # GLScatterPlotItem refs
 
@@ -324,9 +324,16 @@ class VoxelSausageTab(QWidget):
         # ── Step 7: Save ─────────────────────────────────────────────
         grp7 = QGroupBox("Step 7: Save")
         v7   = QVBoxLayout(grp7)
-        btn_save = QPushButton("Save…")
-        btn_save.clicked.connect(self._save)
-        v7.addWidget(btn_save)
+        btn_save_npz = QPushButton("Save Voxels (.npz)")
+        btn_save_npz.clicked.connect(self._save_npz)
+        v7.addWidget(btn_save_npz)
+        self.btn_save_frames = QPushButton("Save All Frames (N × .glb)")
+        self.btn_save_frames.clicked.connect(self._save_all_frames)
+        self.btn_save_frames.setEnabled(False)
+        v7.addWidget(self.btn_save_frames)
+        self.btn_save_skinned = QPushButton("Save Skinned GLB")
+        self.btn_save_skinned.clicked.connect(self._save_skinned)
+        v7.addWidget(self.btn_save_skinned)
         vbox.addWidget(grp7)
 
         # Status
@@ -679,6 +686,7 @@ class VoxelSausageTab(QWidget):
         self._clear_scatter()
         self._mesh_viewer.set_mesh(verts, faces, None, 0)
         self.mesh_lbl.setText(f"{len(verts)} verts, {len(faces)} faces")
+        self.btn_save_skinned.setEnabled(True)
         self._set_status(f"Mesh baked — {len(verts)} verts, {len(faces)} faces.")
 
     # ------------------------------------------------------------------
@@ -712,23 +720,34 @@ class VoxelSausageTab(QWidget):
         if total > 0:
             self.bake_all_progress.setValue(int(100 * done / total))
 
-    def _on_bake_all_done(self, mesh_frames: np.ndarray, faces: np.ndarray):
+    def _on_bake_all_done(self, frames: list):
         if self._bake_thread is not None:
             self._bake_thread.quit()
         self.bake_all_progress.setVisible(False)
         self.btn_bake_all.setEnabled(True)
 
-        self._mesh_frames = mesh_frames
-        self._mesh_verts  = mesh_frames[0]
-        self._mesh_faces  = faces
-        self._bone_weights = None   # world-space bake has no per-bone weights
+        self._mesh_frames = frames
+        self._bone_weights = None
 
-        self._clear_scatter()
-        self._mesh_viewer.set_mesh(self._mesh_verts, faces, None, 0)
+        # Find first non-empty frame for the viewer
+        for verts, faces in frames:
+            if verts is not None and len(verts) > 0:
+                self._mesh_verts = verts
+                self._mesh_faces = faces
+                break
 
-        n, v, f = int(mesh_frames.shape[0]), int(mesh_frames.shape[1]), int(len(faces))
-        self.mesh_lbl.setText(f"{n} frames × {v} verts, {f} faces")
-        self._set_status(f"Baked {n} frames, {v} verts, {f} faces.")
+        if self._mesh_verts is not None:
+            self._clear_scatter()
+            self._mesh_viewer.set_mesh(self._mesh_verts, self._mesh_faces, None, 0)
+
+        counts = [len(v) if v is not None else 0 for v, _ in frames]
+        n = len(frames)
+        summary = ", ".join(str(c) for c in counts[:6])
+        if n > 6:
+            summary += f", … (+{n-6} more)"
+        self.mesh_lbl.setText(f"{n} frames baked — verts: {summary}")
+        self.btn_save_frames.setEnabled(True)
+        self._set_status(f"Baked {n} frames ({summary} verts).")
 
     def _on_bake_all_error(self, msg: str):
         if self._bake_thread is not None:
@@ -741,67 +760,101 @@ class VoxelSausageTab(QWidget):
     # Step 7: Save
     # ------------------------------------------------------------------
 
-    def _save(self):
-        if self._carver is None:
-            self._set_status("Nothing to save yet.")
-            return
-        char = self.state.current_character
-        name = getattr(char, "name", "character") if char else "character"
+    def _pick_save_dir(self) -> str | None:
+        return QFileDialog.getExistingDirectory(self, "Choose output directory") or None
 
-        save_dir = QFileDialog.getExistingDirectory(self, "Choose output directory")
+    def _char_name(self) -> str:
+        char = self.state.current_character
+        return getattr(char, "name", "character") if char else "character"
+
+    def _save_npz(self):
+        """Save voxels (.npz) + skeleton JSON."""
+        if self._carver is None:
+            self._set_status("Generate a ragdoll first (Step 2).")
+            return
+        save_dir = self._pick_save_dir()
         if not save_dir:
             return
-
-        # ── .npz voxels
-        npz_path = os.path.join(save_dir, f"{name}_voxels.npz")
+        name = self._char_name()
         try:
-            self._carver.save(npz_path)
+            self._carver.save(os.path.join(save_dir, f"{name}_voxels.npz"))
         except Exception as exc:
             self._set_status(f"Save voxels error: {exc}")
             return
-
-        # ── skeleton JSON
         sb = self._skeleton_builder
         if sb is not None:
             import json
-            skel_path = os.path.join(save_dir, f"{name}_skeleton.json")
             try:
-                with open(skel_path, "w") as fh:
+                with open(os.path.join(save_dir, f"{name}_skeleton.json"), "w") as fh:
                     json.dump(sb.to_dict(include_poses=False), fh, indent=2)
             except Exception as exc:
                 _logger.warning("skeleton JSON save failed: %s", exc)
+        self._set_status(f"Voxels saved to {save_dir}.")
 
-        # ── .glb mesh
-        if self._mesh_verts is not None and self._mesh_faces is not None:
-            glb_path = os.path.join(save_dir, f"{name}_sausages.glb")
+    def _save_all_frames(self):
+        """Save one GLB per baked frame."""
+        if not self._mesh_frames:
+            self._set_status("Bake all frames first (Step 6).")
+            return
+        save_dir = self._pick_save_dir()
+        if not save_dir:
+            return
+        name = self._char_name()
+        from pipeline.gltf_exporter import GLTFExporter
+        exp = GLTFExporter()
+        saved = 0
+        for f, (verts, faces) in enumerate(self._mesh_frames):
+            if verts is None or len(verts) == 0:
+                _logger.warning("_save_all_frames: frame %d is empty, skipping", f)
+                continue
+            glb_path = os.path.join(save_dir, f"{name}_frame_{f:03d}.glb")
             try:
-                from pipeline.gltf_exporter import GLTFExporter
-                skel_seq = (sb.poses[:, :33, :].astype(np.float32)
-                            if sb is not None else None)
-                n_joints = 33
-                if self._mesh_frames is not None:
-                    # World-space per-frame bake → morph targets, no bone weights
-                    skin_w = None
-                else:
-                    skin_w = np.zeros((len(self._mesh_verts), n_joints),
-                                      dtype=np.float32)
-                    if self._bone_weights is not None:
-                        for vi, jidx in enumerate(self._bone_weights):
-                            col = int(jidx) if int(jidx) < n_joints else 0
-                            skin_w[vi, col] = 1.0
-                exp = GLTFExporter()
                 exp.export_glb(
                     glb_path,
-                    self._mesh_verts.astype(np.float32),
-                    self._mesh_faces.astype(np.int32),
-                    skel_seq,
-                    skinning_weights=skin_w,
-                    mesh_frames=self._mesh_frames,
+                    verts.astype(np.float32),
+                    faces.astype(np.int32),
+                    skeleton_sequence=None,
+                    skinning_weights=None,
                 )
+                saved += 1
             except Exception as exc:
-                _logger.warning("GLB save failed: %s", exc)
+                _logger.warning("frame %d GLB save failed: %s", f, exc)
+        self._set_status(f"Saved {saved} GLB files to {save_dir}.")
 
-        self._set_status(f"Saved to {save_dir}.")
+    def _save_skinned(self):
+        """Save single animated GLB with bones + skinning (from frame-0 bake)."""
+        if self._mesh_verts is None or self._mesh_faces is None:
+            self._set_status("Bake Mesh (frame 0) first (Step 6).")
+            return
+        sb = self._skeleton_builder
+        if sb is None or sb.poses is None:
+            self._set_status("Import a skeleton first (Step 1).")
+            return
+        save_dir = self._pick_save_dir()
+        if not save_dir:
+            return
+        name = self._char_name()
+        from pipeline.gltf_exporter import GLTFExporter
+        skel_seq = sb.poses[:, :33, :].astype(np.float32)
+        n_joints = 33
+        skin_w = np.zeros((len(self._mesh_verts), n_joints), dtype=np.float32)
+        if self._bone_weights is not None:
+            for vi, jidx in enumerate(self._bone_weights):
+                col = int(jidx) if int(jidx) < n_joints else 0
+                skin_w[vi, col] = 1.0
+        glb_path = os.path.join(save_dir, f"{name}_skinned.glb")
+        try:
+            GLTFExporter().export_glb(
+                glb_path,
+                self._mesh_verts.astype(np.float32),
+                self._mesh_faces.astype(np.int32),
+                skeleton_sequence=skel_seq,
+                skinning_weights=skin_w,
+            )
+        except Exception as exc:
+            self._set_status(f"Skinned GLB save failed: {exc}")
+            return
+        self._set_status(f"Skinned GLB saved to {glb_path}.")
 
     # ------------------------------------------------------------------
     # 3D viewer helpers
