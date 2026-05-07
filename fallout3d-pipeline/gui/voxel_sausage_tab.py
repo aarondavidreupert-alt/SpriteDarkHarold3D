@@ -446,6 +446,9 @@ class VoxelSausageTab(QWidget):
             bone_radii=None,
             resolution=resolution,
         )
+        char = self.state.current_character
+        if char is not None:
+            char.voxel_carver = self._carver
         n = len(self._carver.sausages)
         self.ragdoll_lbl.setText(f"{n} bones, {resolution}³ voxels each")
         self._populate_radius_panel()

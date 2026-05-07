@@ -54,6 +54,7 @@ class CharacterData:
     frm_offsets: Optional[list] = None              # [dir][frame] (ox, oy) int tuples — FRM only
     color: Tuple[float, float, float] = (1.0, 0.8, 0.2)
     skeleton: Optional[object] = None               # SkeletonBuilder instance
+    voxel_carver: Optional[object] = None           # VoxelCarver instance (Tab 7c)
 
     @property
     def n_frames(self) -> int:
@@ -80,6 +81,7 @@ class AppState(QObject):
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "assets", "templates",
         )
+        self.master_sausage: Optional[dict] = None  # {joint_idx → (R,R,R) bool}
 
     # ------------------------------------------------------------------
 
@@ -152,6 +154,8 @@ class MainWindow(QMainWindow):
         from gui.mesh_tab import MeshTab
         from gui.mesh_builder_tab import MeshBuilderTab
         from gui.voxel_sausage_tab import VoxelSausageTab
+        from gui.sausage_library_tab import SausageLibraryTab
+        from gui.mesh_export_tab import MeshExportTab
         from gui.export_tab import ExportTab
 
         self.tabs = QTabWidget()
@@ -169,6 +173,8 @@ class MainWindow(QMainWindow):
         self.tab_mesh             = MeshTab(self.state, self)
         self.tab_mesh_builder     = MeshBuilderTab(self.state, self)
         self.tab_voxel_sausage    = VoxelSausageTab(self.state, self)
+        self.tab_sausage_library  = SausageLibraryTab(self.state, self)
+        self.tab_mesh_export      = MeshExportTab(self.state, self)
         self.tab_export           = ExportTab(self.state, self)
 
         self.tabs.addTab(self.tab_asset,            "1 · Asset Loader")
@@ -182,7 +188,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_mesh,             "7 · Mesh & Normals")
         self.tabs.addTab(self.tab_mesh_builder,     "7b · Mesh Builder")
         self.tabs.addTab(self.tab_voxel_sausage,   "7c · Voxel Sausage")
-        self.tabs.addTab(self.tab_export,           "8 · Export")
+        self.tabs.addTab(self.tab_sausage_library, "8 · Sausage Library")
+        self.tabs.addTab(self.tab_mesh_export,     "9 · Mesh Export")
+        self.tabs.addTab(self.tab_export,          "10 · Export")
 
         # Auto-build skeleton after triangulation completes
         self.state.character_updated.connect(self._auto_build_skeleton)
@@ -245,7 +253,7 @@ class MainWindow(QMainWindow):
         act_exp = QAction("Export GLB…", self)
         act_exp.setShortcut("Ctrl+E")
         act_exp.triggered.connect(lambda: (
-            self.tabs.setCurrentIndex(8),
+            self.tabs.setCurrentIndex(self._TAB_EXPORT),
             self.tab_export.export_glb(),
         ))
         tb.addAction(act_exp)
@@ -277,6 +285,8 @@ class MainWindow(QMainWindow):
             "Fit mesh template and bake normal maps",
             "Fit mesh to skeleton, animate, project onto sprite views",
             "Load skeleton JSON, build ragdoll, adjust radii, save template",
+            "Sausage library — collect snapshots, build a master grid",
+            "Mesh export — marching cubes, corrective shape keys, GLB",
             "Export glTF / GLB and animation data",
         ]
         if 0 <= idx < len(labels):
@@ -314,7 +324,9 @@ class MainWindow(QMainWindow):
     _TAB_MESH           = 8
     _TAB_MESH_BUILDER   = 9
     _TAB_VOXEL_SAUSAGE  = 10
-    _TAB_EXPORT         = 11
+    _TAB_SAUSAGE_LIB    = 11
+    _TAB_MESH_EXPORT    = 12
+    _TAB_EXPORT         = 13
 
     def run_pipeline_until(self, target: int):
         """Run the full pipeline from asset-load up to and including *target* tab."""
