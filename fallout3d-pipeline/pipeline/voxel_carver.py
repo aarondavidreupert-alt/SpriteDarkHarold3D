@@ -430,6 +430,170 @@ class VoxelCarver:
 
     # ------------------------------------------------------------------
 
+    def bake_corrective_frames(
+        self, k_neighbours: int = 3
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Bake (verts_0, faces, bone_ids, shape_keys) for the corrective GLB.
+
+        verts_0   float32 (V, 3)  — Frame-0 bind mesh from to_combined_mesh()
+        faces     int32   (F, 3)
+        bone_ids  int32   (V,)    — joint_idx per vertex
+        shape_keys float32 (N, V, 3) — per-frame delta = corrected - verts_0
+
+        Per-frame algorithm:
+          1. Deform each vertex via its bone's transform T_f ∘ inv(T_0).
+          2. Bake frame-f world-space mesh (same fixed grid as bake_world_grid).
+          3. For each bone category: build cKDTree on that bone's surface region,
+             snap deformed verts to nearest surface point (guard: max_dist = voxel_size×2).
+          4. delta = corrected - verts_0
+        """
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError as exc:
+            raise ImportError("scipy required: pip install scipy") from exc
+        try:
+            from skimage.measure import marching_cubes
+        except ImportError as exc:
+            raise ImportError("scikit-image required: pip install scikit-image") from exc
+
+        poses = self.skeleton_builder.poses
+        if poses is None or poses.shape[0] == 0 or not self.sausages:
+            raise RuntimeError("No poses or sausages — import skeleton and generate ragdoll first.")
+
+        # ── Frame-0 bind mesh ───────────────────────────────────────────
+        verts_0, faces, bone_ids = self.to_combined_mesh()
+        if len(verts_0) == 0:
+            raise RuntimeError("Frame-0 mesh is empty — run Bake Mesh first.")
+
+        V = len(verts_0)
+        n_frames = int(poses.shape[0])
+
+        # Pre-compute Frame-0 bone transforms
+        l2w_0: Dict[int, np.ndarray] = {}
+        w2l_0: Dict[int, np.ndarray] = {}
+        for jidx, s in self.sausages.items():
+            l2w, w2l = BoneSausage._build_bone_matrix(
+                poses[0, s.parent_idx], poses[0, s.joint_idx])
+            l2w_0[jidx] = l2w
+            w2l_0[jidx] = w2l
+
+        # ── Fixed world-space grid (identical to bake_world_grid) ───────
+        bbox_min = np.full(3,  np.inf, np.float64)
+        bbox_max = np.full(3, -np.inf, np.float64)
+        for f in range(n_frames):
+            for s in self.sausages.values():
+                if s.voxels is None or not s.voxels.any():
+                    continue
+                idx = np.argwhere(s.voxels)
+                if len(idx) == 0:
+                    continue
+                local_pts = s.grid_origin + idx * s.voxel_size
+                l2w, _ = BoneSausage._build_bone_matrix(
+                    poses[f, s.parent_idx], poses[f, s.joint_idx])
+                M = len(local_pts)
+                wp = (l2w @ np.hstack([local_pts, np.ones((M, 1))]).T).T[:, :3]
+                bbox_min = np.minimum(bbox_min, wp.min(axis=0))
+                bbox_max = np.maximum(bbox_max, wp.max(axis=0))
+
+        if not np.all(np.isfinite(bbox_min)):
+            raise RuntimeError("Could not compute world bbox — no occupied voxels?")
+
+        resolution = 64
+        voxel_size_w = float((bbox_max - bbox_min).max()) / max(resolution - 1, 1)
+        if voxel_size_w < 1e-12:
+            raise RuntimeError("Degenerate world bbox.")
+        pad = 2.0 * voxel_size_w
+        grid_lo = bbox_min - pad
+        grid_hi = bbox_max + pad
+        gs = np.ceil((grid_hi - grid_lo) / voxel_size_w).astype(int) + 1
+        nx, ny, nz = int(gs[0]), int(gs[1]), int(gs[2])
+        max_dist = voxel_size_w * 2.0
+
+        bone_list = list(self.sausages.keys())
+        unique_bones = np.unique(bone_ids)
+
+        def _bake_frame_mc(f: int) -> Optional[np.ndarray]:
+            grid = np.zeros((nx, ny, nz), dtype=bool)
+            for s in self.sausages.values():
+                if s.voxels is None or not s.voxels.any():
+                    continue
+                idx = np.argwhere(s.voxels)
+                if len(idx) == 0:
+                    continue
+                lp = s.grid_origin + idx * s.voxel_size
+                l2w, _ = BoneSausage._build_bone_matrix(
+                    poses[f, s.parent_idx], poses[f, s.joint_idx])
+                M = len(lp)
+                wp = (l2w @ np.hstack([lp, np.ones((M, 1))]).T).T[:, :3]
+                gi = np.round((wp - grid_lo) / voxel_size_w).astype(int)
+                valid = (np.all(gi >= 0, axis=1) &
+                         (gi[:, 0] < nx) & (gi[:, 1] < ny) & (gi[:, 2] < nz))
+                gi = gi[valid]
+                if len(gi):
+                    grid[gi[:, 0], gi[:, 1], gi[:, 2]] = True
+            if not grid.any():
+                return None
+            try:
+                vf, _, _, _ = marching_cubes(grid.astype(np.float32), level=0.5)
+                return (vf * voxel_size_w + grid_lo).astype(np.float32)
+            except ValueError:
+                return None
+
+        def _deform_verts(f: int) -> np.ndarray:
+            out = verts_0.copy()
+            for jidx, s in self.sausages.items():
+                mask = (bone_ids == jidx)
+                if not mask.any() or jidx not in w2l_0:
+                    continue
+                l2w_f, _ = BoneSausage._build_bone_matrix(
+                    poses[f, s.parent_idx], poses[f, s.joint_idx])
+                T = l2w_f @ w2l_0[jidx]
+                vb = verts_0[mask]
+                M = len(vb)
+                out[mask] = (T @ np.hstack([vb, np.ones((M, 1))]).T).T[:, :3].astype(np.float32)
+            return out
+
+        # ── Per-frame shape keys ────────────────────────────────────────
+        shape_keys = np.zeros((n_frames, V, 3), dtype=np.float32)
+
+        for f in range(n_frames):
+            deformed = _deform_verts(f)
+            surf_f = _bake_frame_mc(f)
+
+            if surf_f is None or len(surf_f) == 0:
+                shape_keys[f] = deformed - verts_0
+                continue
+
+            # Assign surface verts to bone categories by nearest bone head
+            bone_heads_f = np.array(
+                [poses[f, self.sausages[b].parent_idx] for b in bone_list],
+                dtype=np.float64)
+            head_tree = cKDTree(bone_heads_f)
+            _, assign_idx = head_tree.query(surf_f.astype(np.float64))
+            bone_assign = np.array([bone_list[i] for i in assign_idx], dtype=np.int32)
+
+            corrected = deformed.copy()
+            for bone_id in unique_bones:
+                v_mask = (bone_ids == bone_id)
+                if not v_mask.any():
+                    continue
+                w_mask = (bone_assign == bone_id)
+                if not w_mask.any():
+                    continue
+                bone_surf = surf_f[w_mask]
+                tree = cKDTree(bone_surf.astype(np.float64))
+                dists, nn_idx = tree.query(deformed[v_mask].astype(np.float64), k=1)
+                close = dists <= max_dist
+                src = np.where(v_mask)[0][close]
+                corrected[src] = bone_surf[nn_idx[close]]
+
+            shape_keys[f] = corrected - verts_0
+
+        return verts_0, faces, bone_ids, shape_keys
+
+    # ------------------------------------------------------------------
+
     def world_bounds(self, n_frames: Optional[int] = None
                      ) -> Tuple[np.ndarray, np.ndarray]:
         """

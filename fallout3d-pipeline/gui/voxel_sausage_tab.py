@@ -77,6 +77,23 @@ class BakeAllWorker(QObject):
             self.error.emit(str(exc))
 
 
+class CorrectiveWorker(QObject):
+    """Bake corrective shape keys in a background thread."""
+    finished = pyqtSignal(object)   # (verts_0, faces, bone_ids, shape_keys)
+    error    = pyqtSignal(str)
+
+    def __init__(self, carver: VoxelCarver):
+        super().__init__()
+        self._carver = carver
+
+    def run(self):
+        try:
+            result = self._carver.bake_corrective_frames()
+            self.finished.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class CarveWorker(QObject):
     progress = pyqtSignal(int, int)   # (done, total)
     finished = pyqtSignal()
@@ -125,6 +142,8 @@ class VoxelSausageTab(QWidget):
         self._carve_worker: CarveWorker | None = None
         self._bake_thread: QThread | None = None
         self._bake_worker: BakeAllWorker | None = None
+        self._corrective_thread: QThread | None = None
+        self._corrective_worker: CorrectiveWorker | None = None
 
         self._radius_spins: dict[int, QDoubleSpinBox] = {}
 
@@ -331,9 +350,10 @@ class VoxelSausageTab(QWidget):
         self.btn_save_frames.clicked.connect(self._save_all_frames)
         self.btn_save_frames.setEnabled(False)
         v7.addWidget(self.btn_save_frames)
-        self.btn_save_skinned = QPushButton("Save Skinned GLB")
-        self.btn_save_skinned.clicked.connect(self._save_skinned)
-        v7.addWidget(self.btn_save_skinned)
+        self.btn_save_corrective = QPushButton("Save Corrective GLB")
+        self.btn_save_corrective.clicked.connect(self._save_corrective)
+        self.btn_save_corrective.setEnabled(False)
+        v7.addWidget(self.btn_save_corrective)
         vbox.addWidget(grp7)
 
         # Status
@@ -686,7 +706,7 @@ class VoxelSausageTab(QWidget):
         self._clear_scatter()
         self._mesh_viewer.set_mesh(verts, faces, None, 0)
         self.mesh_lbl.setText(f"{len(verts)} verts, {len(faces)} faces")
-        self.btn_save_skinned.setEnabled(True)
+        self.btn_save_corrective.setEnabled(True)
         self._set_status(f"Mesh baked — {len(verts)} verts, {len(faces)} faces.")
 
     # ------------------------------------------------------------------
@@ -821,15 +841,38 @@ class VoxelSausageTab(QWidget):
                 _logger.warning("frame %d GLB save failed: %s", f, exc)
         self._set_status(f"Saved {saved} GLB files to {save_dir}.")
 
-    def _save_skinned(self):
-        """Save single animated GLB with bones + skinning (from frame-0 bake)."""
-        if self._mesh_verts is None or self._mesh_faces is None:
+    def _save_corrective(self):
+        """Bake corrective shape keys then save a single animated GLB."""
+        if self._carver is None or self._mesh_verts is None:
             self._set_status("Bake Mesh (frame 0) first (Step 6).")
             return
         sb = self._skeleton_builder
         if sb is None or sb.poses is None:
             self._set_status("Import a skeleton first (Step 1).")
             return
+
+        self._set_status("Computing corrective shape keys (background)…")
+        self.btn_save_corrective.setEnabled(False)
+
+        self._corrective_worker = CorrectiveWorker(self._carver)
+        self._corrective_thread = QThread(self)
+        self._corrective_worker.moveToThread(self._corrective_thread)
+        self._corrective_thread.started.connect(self._corrective_worker.run)
+        self._corrective_worker.finished.connect(self._on_corrective_done)
+        self._corrective_worker.error.connect(self._on_corrective_error)
+        self._corrective_thread.start()
+
+    def _on_corrective_done(self, result):
+        if self._corrective_thread is not None:
+            self._corrective_thread.quit()
+        self.btn_save_corrective.setEnabled(True)
+
+        verts_0, faces, bone_ids, shape_keys = result
+        sb = self._skeleton_builder
+        if sb is None or sb.poses is None:
+            self._set_status("Skeleton lost — cannot save.")
+            return
+
         save_dir = self._pick_save_dir()
         if not save_dir:
             return
@@ -837,24 +880,30 @@ class VoxelSausageTab(QWidget):
         from pipeline.gltf_exporter import GLTFExporter
         skel_seq = sb.poses[:, :33, :].astype(np.float32)
         n_joints = 33
-        skin_w = np.zeros((len(self._mesh_verts), n_joints), dtype=np.float32)
-        if self._bone_weights is not None:
-            for vi, jidx in enumerate(self._bone_weights):
-                col = int(jidx) if int(jidx) < n_joints else 0
-                skin_w[vi, col] = 1.0
-        glb_path = os.path.join(save_dir, f"{name}_skinned.glb")
+        skin_w = np.zeros((len(verts_0), n_joints), dtype=np.float32)
+        for vi, jidx in enumerate(bone_ids):
+            col = int(jidx) if int(jidx) < n_joints else 0
+            skin_w[vi, col] = 1.0
+        glb_path = os.path.join(save_dir, f"{name}_corrective.glb")
         try:
             GLTFExporter(fps=float(self.fps_spin.value())).export_glb(
                 glb_path,
-                self._mesh_verts.astype(np.float32),
-                self._mesh_faces.astype(np.int32),
+                verts_0.astype(np.float32),
+                faces.astype(np.int32),
                 skeleton_sequence=skel_seq,
                 skinning_weights=skin_w,
+                shape_keys=shape_keys,
             )
         except Exception as exc:
-            self._set_status(f"Skinned GLB save failed: {exc}")
+            self._set_status(f"Corrective GLB save failed: {exc}")
             return
-        self._set_status(f"Skinned GLB saved to {glb_path}.")
+        self._set_status(f"Corrective GLB saved to {glb_path}.")
+
+    def _on_corrective_error(self, msg: str):
+        if self._corrective_thread is not None:
+            self._corrective_thread.quit()
+        self.btn_save_corrective.setEnabled(True)
+        self._set_status(f"Corrective bake error: {msg}")
 
     # ------------------------------------------------------------------
     # 3D viewer helpers

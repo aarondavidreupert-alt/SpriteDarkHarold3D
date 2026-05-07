@@ -60,7 +60,8 @@ class GLTFExporter:
         skinning_weights: Optional[np.ndarray] = None,  # (V, J)
         normal_maps: Optional[np.ndarray] = None,        # (6, N, H, W, 3)
         uvs: Optional[np.ndarray] = None,               # (V, 2)
-        mesh_frames: Optional[np.ndarray] = None,       # (N, V, 3) per-frame verts
+        mesh_frames: Optional[np.ndarray] = None,       # (N, V, 3) per-frame absolute verts
+        shape_keys: Optional[np.ndarray] = None,        # (N, V, 3) pre-computed deltas
     ):
         if not _PYGLTF_AVAILABLE:
             raise RuntimeError("pygltflib is not installed. Run: pip install pygltflib")
@@ -186,23 +187,32 @@ class GLTFExporter:
         morph_target_acc: list[int] = []
         morph_n_targets = 0
         morph_stride = 1
-        if mesh_frames is not None and len(mesh_frames) >= 2 and \
-                mesh_frames.shape[1] == len(vertices):
-            n_total = int(mesh_frames.shape[0])
+
+        def _add_delta_accessors(deltas: np.ndarray):
+            """deltas: (K, V, 3) float32 pre-computed deltas."""
+            nonlocal morph_stride, morph_n_targets
+            n_total = int(deltas.shape[0])
             morph_stride = max(1, (n_total + 254) // 255)
-            sel = mesh_frames[::morph_stride]
+            sel = deltas[::morph_stride]
             if len(sel) > 255:
                 sel = sel[:255]
-            rest = verts_f32
             for i in range(len(sel)):
-                delta = (sel[i].astype(np.float32) - rest)
-                if not np.any(np.isfinite(delta)):
-                    delta = np.zeros_like(rest)
-                delta = np.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
-                acc = add_accessor(delta, pygltflib.FLOAT, pygltflib.VEC3,
-                                   target=pygltflib.ARRAY_BUFFER)
-                morph_target_acc.append(acc)
+                delta = np.nan_to_num(sel[i].astype(np.float32),
+                                      nan=0.0, posinf=0.0, neginf=0.0)
+                morph_target_acc.append(
+                    add_accessor(delta, pygltflib.FLOAT, pygltflib.VEC3,
+                                 target=pygltflib.ARRAY_BUFFER))
             morph_n_targets = len(morph_target_acc)
+
+        if shape_keys is not None and len(shape_keys) >= 2 and \
+                shape_keys.shape[1] == len(vertices):
+            _add_delta_accessors(shape_keys.astype(np.float32))
+        elif mesh_frames is not None and len(mesh_frames) >= 2 and \
+                mesh_frames.shape[1] == len(vertices):
+            deltas = mesh_frames.astype(np.float32) - verts_f32[np.newaxis]
+            _add_delta_accessors(deltas)
+
+        if morph_n_targets > 0:
             primitive.targets = [
                 pygltflib.Attributes(POSITION=a) for a in morph_target_acc
             ]
