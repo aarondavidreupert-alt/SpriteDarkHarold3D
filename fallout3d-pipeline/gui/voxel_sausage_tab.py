@@ -58,43 +58,21 @@ class BakeAllWorker(QObject):
     finished = pyqtSignal(object, object)  # (mesh_frames (N,V,3), faces (F,3))
     error    = pyqtSignal(str)
 
-    def __init__(self, carver: VoxelCarver, n_frames: int, world_res: int = 64):
+    def __init__(self, carver: VoxelCarver, world_res: int = 64):
         super().__init__()
         self._carver    = carver
-        self._n_frames  = n_frames
         self._world_res = world_res
 
     def run(self):
         try:
-            poses = self._carver.skeleton_builder.poses
-            n = min(self._n_frames, int(poses.shape[0]))
-
-            world_lo, world_hi = self._carver.world_bounds(n)
-
-            rest_v, rest_f = self._carver.bake_frame_world(
-                0, world_lo, world_hi, self._world_res)
-            if rest_v is None or rest_f is None:
-                self.error.emit("Frame 0 produced no mesh — carve voxels first.")
+            mesh_frames, faces = self._carver.bake_world_grid(
+                resolution=self._world_res,
+                progress_cb=lambda d, t: self.progress.emit(d, t),
+            )
+            if mesh_frames.size == 0 or len(faces) == 0:
+                self.error.emit("Bake produced no mesh — carve voxels first.")
                 return
-
-            V = len(rest_v)
-            frames = [rest_v]
-            self.progress.emit(1, n)
-
-            for f in range(1, n):
-                v, _ = self._carver.bake_frame_world(
-                    f, world_lo, world_hi, self._world_res)
-                if v is not None and len(v) == V:
-                    frames.append(v)
-                else:
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "bake_frame_world frame %d: vertex count %s ≠ %d, "
-                        "using rest pose", f, len(v) if v is not None else None, V)
-                    frames.append(rest_v)
-                self.progress.emit(f + 1, n)
-
-            self.finished.emit(np.stack(frames, axis=0), rest_f)
+            self.finished.emit(mesh_frames, faces)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -721,7 +699,7 @@ class VoxelSausageTab(QWidget):
         self.bake_all_progress.setValue(0)
         self.btn_bake_all.setEnabled(False)
 
-        self._bake_worker = BakeAllWorker(self._carver, n_frames, world_res)
+        self._bake_worker = BakeAllWorker(self._carver, world_res)
         self._bake_thread = QThread(self)
         self._bake_worker.moveToThread(self._bake_thread)
         self._bake_thread.started.connect(self._bake_worker.run)

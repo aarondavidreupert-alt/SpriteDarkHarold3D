@@ -336,6 +336,126 @@ class VoxelCarver:
 
     # ------------------------------------------------------------------
 
+    def bake_world_grid(
+        self,
+        resolution: int = 64,
+        progress_cb=None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Bake per-frame meshes through a single fixed world-space grid.
+
+        Stable topology across frames is achieved by:
+          * computing the bounding box from ALL transformed voxel points,
+          * cubic voxels (same voxel_size on all 3 axes),
+          * a single grid_shape used for every frame.
+
+        Frames whose marching-cubes vertex count differs from frame 0 fall
+        back to the frame-0 mesh (a warning is logged).
+
+        Returns (mesh_frames float32 (N, V, 3), faces int32 (F, 3)).
+        """
+        try:
+            from skimage.measure import marching_cubes
+        except ImportError as exc:
+            raise ImportError("scikit-image required: pip install scikit-image") from exc
+
+        poses = self.skeleton_builder.poses
+        empty = (np.zeros((0, 0, 3), np.float32), np.zeros((0, 3), np.int32))
+        if poses is None or poses.shape[0] == 0 or not self.sausages:
+            return empty
+        n_frames = int(poses.shape[0])
+
+        # ── Step 1: collect transformed voxel points + bbox over all frames ──
+        per_frame_points: list[list[np.ndarray]] = []
+        bbox_min = np.full(3,  np.inf, np.float64)
+        bbox_max = np.full(3, -np.inf, np.float64)
+        for f in range(n_frames):
+            frame_pts: list[np.ndarray] = []
+            for s in self.sausages.values():
+                if s.voxels is None or not s.voxels.any():
+                    continue
+                idx = np.argwhere(s.voxels)
+                if len(idx) == 0:
+                    continue
+                local_pts = s.grid_origin + idx * s.voxel_size
+                head_w = poses[f, s.parent_idx]
+                tail_w = poses[f, s.joint_idx]
+                l2w, _ = BoneSausage._build_bone_matrix(head_w, tail_w)
+                M = len(local_pts)
+                world_pts = (l2w @ np.hstack([local_pts, np.ones((M, 1))]).T).T[:, :3]
+                frame_pts.append(world_pts)
+                bbox_min = np.minimum(bbox_min, world_pts.min(axis=0))
+                bbox_max = np.maximum(bbox_max, world_pts.max(axis=0))
+            per_frame_points.append(frame_pts)
+
+        if not np.all(np.isfinite(bbox_min)):
+            return empty
+
+        # ── Step 2: fixed cubic grid ──────────────────────────────────────
+        voxel_size = float((bbox_max - bbox_min).max()) / max(resolution - 1, 1)
+        if voxel_size < 1e-12:
+            return empty
+        pad = 2.0 * voxel_size
+        grid_lo = bbox_min - pad
+        grid_hi = bbox_max + pad
+        grid_shape = np.ceil((grid_hi - grid_lo) / voxel_size).astype(int) + 1
+        nx, ny, nz = int(grid_shape[0]), int(grid_shape[1]), int(grid_shape[2])
+
+        def _rasterise(frame_pts: list[np.ndarray]) -> np.ndarray:
+            grid = np.zeros((nx, ny, nz), dtype=bool)
+            for world_pts in frame_pts:
+                gi = np.round((world_pts - grid_lo) / voxel_size).astype(int)
+                valid = (np.all(gi >= 0, axis=1) &
+                         (gi[:, 0] < nx) & (gi[:, 1] < ny) & (gi[:, 2] < nz))
+                gi = gi[valid]
+                if len(gi):
+                    grid[gi[:, 0], gi[:, 1], gi[:, 2]] = True
+            return grid
+
+        # ── Step 3: marching cubes per frame ─────────────────────────────
+        grid0 = _rasterise(per_frame_points[0]).astype(np.float32)
+        if not grid0.any():
+            return empty
+        try:
+            v0, faces_ref, _, _ = marching_cubes(grid0, level=0.5)
+        except ValueError:
+            return empty
+        V = int(len(v0))
+        rest_world = (v0 * voxel_size + grid_lo).astype(np.float32)
+        mesh_frames: list[np.ndarray] = [rest_world]
+        if progress_cb is not None:
+            progress_cb(1, n_frames)
+
+        mismatches = 0
+        for f in range(1, n_frames):
+            grid_f = _rasterise(per_frame_points[f]).astype(np.float32)
+            verts_world = None
+            if grid_f.any():
+                try:
+                    vf, _, _, _ = marching_cubes(grid_f, level=0.5)
+                    if len(vf) == V:
+                        verts_world = (vf * voxel_size + grid_lo).astype(np.float32)
+                    else:
+                        _logger.warning(
+                            "bake_world_grid frame %d: %d verts ≠ %d (rest pose)",
+                            f, len(vf), V)
+                except ValueError:
+                    pass
+            if verts_world is None:
+                verts_world = rest_world
+                mismatches += 1
+            mesh_frames.append(verts_world)
+            if progress_cb is not None:
+                progress_cb(f + 1, n_frames)
+
+        if mismatches:
+            _logger.info("bake_world_grid: %d/%d frames fell back to rest pose",
+                         mismatches, n_frames)
+
+        return np.stack(mesh_frames, axis=0), faces_ref.astype(np.int32)
+
+    # ------------------------------------------------------------------
+
     def world_bounds(self, n_frames: Optional[int] = None
                      ) -> Tuple[np.ndarray, np.ndarray]:
         """
