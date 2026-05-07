@@ -152,6 +152,20 @@ class GLTFExporter:
                                    target=pygltflib.ARRAY_BUFFER)
             prim_extras = {"JOINTS_0": jnt_acc, "WEIGHTS_0": wgt_acc}
 
+        # inverseBindMatrices: pure-translate inverse of each joint's bind pose.
+        # MediaPipe joints are positions only — no rotation — so the inverse
+        # is simply T(-p).  glTF stores matrices column-major; numpy's default
+        # tobytes() is row-major so we transpose before flattening.
+        if skeleton_sequence is not None and skinning_weights is not None:
+            inv_binds = np.tile(np.eye(4, dtype=np.float32),
+                                (n_joints, 1, 1))
+            inv_binds[:, :3, 3] = -skeleton_sequence[0, :n_joints].astype(np.float32)
+            inv_binds_cm = np.transpose(inv_binds, (0, 2, 1)
+                                        ).reshape(n_joints, 16).astype(np.float32)
+            ibm_acc = add_accessor(inv_binds_cm,
+                                   pygltflib.FLOAT, pygltflib.MAT4)
+            gltf.skins[skin_idx].inverseBindMatrices = ibm_acc
+
         mesh_node_idx = len(gltf.nodes)
         gltf.nodes.append(pygltflib.Node(name="Mesh", mesh=0, skin=skin_idx))
 

@@ -844,7 +844,7 @@ class VoxelSausageTab(QWidget):
                 skin_w[vi, col] = 1.0
         glb_path = os.path.join(save_dir, f"{name}_skinned.glb")
         try:
-            GLTFExporter().export_glb(
+            GLTFExporter(fps=float(self.fps_spin.value())).export_glb(
                 glb_path,
                 self._mesh_verts.astype(np.float32),
                 self._mesh_faces.astype(np.int32),
