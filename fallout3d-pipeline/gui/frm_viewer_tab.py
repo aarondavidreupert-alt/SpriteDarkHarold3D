@@ -117,6 +117,7 @@ class FrmViewerTab(QWidget):
         self.state.selection_changed.connect(self._on_char_changed)
         self.state.frame_changed.connect(self._on_frame_changed)
         self.state.character_updated.connect(self._on_char_updated)
+        self.state.character_added.connect(self._on_char_added)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -204,18 +205,6 @@ class FrmViewerTab(QWidget):
         pb_l.addWidget(self._frame_lbl)
         ll.addWidget(pb_box)
 
-        # Manual L/R flip
-        flip_box = QGroupBox("Manual Correction")
-        flip_l = QVBoxLayout(flip_box)
-        self._btn_flip = QPushButton("↔ Flip L/R for Dir 1 NE")
-        self._btn_flip.setToolTip(
-            "Horizontally mirror all frames for the selected direction.\n"
-            "Use this when the FRM sprite was stored mirrored."
-        )
-        self._btn_flip.clicked.connect(self._flip_current_dir)
-        flip_l.addWidget(self._btn_flip)
-        ll.addWidget(flip_box)
-
         # Canvas size control
         canvas_box = QGroupBox("Canvas Size")
         canvas_l = QVBoxLayout(canvas_box)
@@ -273,9 +262,6 @@ class FrmViewerTab(QWidget):
             btn.setChecked(i == idx)
         for i, cell in enumerate(self._cells):
             cell.set_selected(i == idx)
-        self._btn_flip.setText(
-            f"↔ Flip L/R for Dir {idx + 1} {_DIR_NAMES[idx]}"
-        )
         self._refresh_status()
 
     # ------------------------------------------------------------------
@@ -326,34 +312,18 @@ class FrmViewerTab(QWidget):
             self.state.set_frame(min(char.n_frames - 1, self.state.current_frame + 1))
 
     # ------------------------------------------------------------------
-    # L/R flip operation
-    # ------------------------------------------------------------------
-
-    def _flip_current_dir(self):
-        char = self.state.current_character
-        if char is None:
-            return
-        d = self._selected_dir
-        if d >= char.frames.shape[0]:
-            return
-        # Flip all frames for this direction along the W axis (horizontal mirror).
-        # char.frames[d] has shape (n_frames, H, W, 3); W is axis 2.
-        char.frames[d] = np.flip(char.frames[d], axis=2).copy()
-        # Mirror frm_offsets x-coords if present
-        if char.frm_offsets is not None and d < len(char.frm_offsets):
-            cw = char.frames.shape[3]
-            char.frm_offsets[d] = [
-                (cw - 1 - ox, oy) for ox, oy in char.frm_offsets[d]
-            ]
-        self.state.character_updated.emit(self.state.selected_idx)
-        self._refresh_cells(self.state.current_frame)
-        self._status_lbl.setText(
-            f"Dir {d + 1} {_DIR_NAMES[d]} flipped horizontally."
-        )
-
-    # ------------------------------------------------------------------
     # Canvas recomposite
     # ------------------------------------------------------------------
+
+    def _on_char_added(self, idx: int):
+        """Auto-apply canvas when a new FRM character is loaded."""
+        chars = self.state.characters
+        char = chars[idx] if 0 <= idx < len(chars) else None
+        if char is None:
+            return
+        src = char.source_path or ""
+        if src.lower().endswith(".frm") and os.path.exists(src):
+            QTimer.singleShot(50, self._apply_canvas)
 
     def _apply_canvas(self):
         char = self.state.current_character
