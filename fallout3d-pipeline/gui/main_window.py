@@ -82,6 +82,7 @@ class AppState(QObject):
             "assets", "templates",
         )
         self.master_sausage: Optional[dict] = None  # {joint_idx → (R,R,R) bool}
+        self.frm_folder: str = ""  # last scanned folder (FRM Browser)
 
     # ------------------------------------------------------------------
 
@@ -145,6 +146,7 @@ class MainWindow(QMainWindow):
     def _build_tabs(self):
         from gui.asset_loader_tab import AssetLoaderTab
         from gui.frm_viewer_tab import FrmViewerTab
+        from gui.frm_browser_tab import FrmBrowserTab
         from gui.upscaler_tab import UpscalerTab
         from gui.pose_editor_tab import PoseEditorTab
         from gui.pose_editor_tab2 import PoseManualEditorTab
@@ -164,6 +166,7 @@ class MainWindow(QMainWindow):
 
         self.tab_asset            = AssetLoaderTab(self.state, self)
         self.tab_frm_viewer       = FrmViewerTab(self.state, self)
+        self.tab_frm_browser      = FrmBrowserTab(self.state, self)
         self.tab_upscaler         = UpscalerTab(self.state, self)
         self.tab_pose             = PoseEditorTab(self.state, self)
         self.tab_pose_editor      = PoseManualEditorTab(self.state, self)
@@ -179,6 +182,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.tab_asset,            "1 · Asset Loader")
         self.tabs.addTab(self.tab_frm_viewer,       "1b · FRM Viewer")
+        self.tabs.addTab(self.tab_frm_browser,      "1c · FRM Browser")
         self.tabs.addTab(self.tab_upscaler,         "2 · Upscaler")
         self.tabs.addTab(self.tab_pose,             "3 · Pose Detector")
         self.tabs.addTab(self.tab_pose_editor,      "4 · Pose Editor")
@@ -276,6 +280,7 @@ class MainWindow(QMainWindow):
         labels = [
             "Load critter sprites (.npy / .png / .frm)",
             "Preview and verify FRM frame registration",
+            "Browse FRM animations by character, armor, and animation type — click to load into pipeline",
             "Upscale frames with Real-ESRGAN",
             "Run MediaPipe pose detection",
             "Manually drag and correct 2D pose landmarks",
@@ -315,18 +320,19 @@ class MainWindow(QMainWindow):
     # Tab index constants (must match addTab order in _build_tabs)
     _TAB_ASSET          = 0
     _TAB_FRM_VIEWER     = 1
-    _TAB_UPSCALER       = 2
-    _TAB_POSE           = 3
-    _TAB_POSE_EDITOR    = 4
-    _TAB_RECON          = 5
-    _TAB_SKELETON       = 6
-    _TAB_LIBRARY        = 7
-    _TAB_MESH           = 8
-    _TAB_MESH_BUILDER   = 9
-    _TAB_VOXEL_SAUSAGE  = 10
-    _TAB_SAUSAGE_LIB    = 11
-    _TAB_MESH_EXPORT    = 12
-    _TAB_EXPORT         = 13
+    _TAB_FRM_BROWSER    = 2
+    _TAB_UPSCALER       = 3
+    _TAB_POSE           = 4
+    _TAB_POSE_EDITOR    = 5
+    _TAB_RECON          = 6
+    _TAB_SKELETON       = 7
+    _TAB_LIBRARY        = 8
+    _TAB_MESH           = 9
+    _TAB_MESH_BUILDER   = 10
+    _TAB_VOXEL_SAUSAGE  = 11
+    _TAB_SAUSAGE_LIB    = 12
+    _TAB_MESH_EXPORT    = 13
+    _TAB_EXPORT         = 14
 
     def run_pipeline_until(self, target: int):
         """Run the full pipeline from asset-load up to and including *target* tab."""

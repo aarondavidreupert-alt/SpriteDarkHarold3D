@@ -6,3 +6,4 @@ from .normal_map_baker import NormalMapBaker
 from .gltf_exporter import GLTFExporter
 from .ao_baker import AmbientOcclusionBaker
 from .shadow_sprite import ShadowSpriteGenerator
+from .frm_catalog import FrmCatalog, FrmEntry
