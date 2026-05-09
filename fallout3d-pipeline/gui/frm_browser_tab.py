@@ -113,6 +113,49 @@ def _frm_all_dirs_first_frame(path: str, pal_table: np.ndarray | None
         return None
 
 
+def _frm_all_frames_rgb(path: str, pal_table: np.ndarray | None
+                        ) -> np.ndarray | None:
+    """
+    Decode every direction × every frame into shape (n_dirs, n_frames, H, W, 3).
+
+    Frames of varying sizes are centre-pasted onto a common canvas of
+    (max_H, max_W).  Returns None on any failure.
+    """
+    if not _FRM_AVAILABLE:
+        return None
+    try:
+        with open(path, "rb") as f:
+            info = _frmpixels.readFRMInfo(f, exportImage=True)
+        offsets  = info["frameOffsets"]
+        pixels   = info["framePixels"]
+        n_dirs   = min(6, len(offsets))
+        n_frames = int(info["numFrames"])
+        # determine common canvas size
+        max_h, max_w = 1, 1
+        for d in range(n_dirs):
+            for fi in range(min(n_frames, len(offsets[d]))):
+                fo = offsets[d][fi]
+                max_h = max(max_h, fo["h"])
+                max_w = max(max_w, fo["w"])
+        out = np.zeros((n_dirs, n_frames, max_h, max_w, 3), dtype=np.uint8)
+        for d in range(n_dirs):
+            for fi in range(min(n_frames, len(offsets[d]))):
+                if fi >= len(pixels[d]):
+                    continue
+                fo  = offsets[d][fi]
+                fh, fw = fo["h"], fo["w"]
+                idx = pixels[d][fi].reshape(fh, fw)
+                rgb = pal_table[idx] if pal_table is not None else (
+                    lambda g: np.stack([g, g, g], axis=-1))(idx.astype(np.uint8))
+                y0 = (max_h - fh) // 2
+                x0 = (max_w - fw) // 2
+                out[d, fi, y0:y0 + fh, x0:x0 + fw] = rgb
+        return out
+    except Exception as exc:
+        _logger.debug("FRM full decode failed for %s: %s", path, exc)
+        return None
+
+
 def _rgb_to_pixmap(rgb: np.ndarray, max_side: int = 48) -> QPixmap:
     if rgb.dtype != np.uint8:
         rgb = rgb.astype(np.uint8)
@@ -207,10 +250,11 @@ class FrmBrowserTab(QWidget):
         self._pool = QThreadPool.globalInstance()
 
         self._cur_entry: FrmEntry | None = None
-        self._preview_dirs: list[np.ndarray] = []
+        self._preview_frames: np.ndarray | None = None  # (n_dirs, N, H, W, 3)
+        self._preview_n_frames: int = 0
+        self._preview_frame: int = 0
         self._preview_anim_timer = QTimer(self)
         self._preview_anim_timer.timeout.connect(self._preview_tick)
-        self._preview_frame_idx = 0
 
         self._build_ui()
 
@@ -339,18 +383,39 @@ class FrmBrowserTab(QWidget):
             self._preview_cells.append(cell)
         gv.addWidget(grid_box)
 
-        # Playback controls (decorative — first frame only is decoded above,
-        # but we still expose Stop/Play uniformity with viewer)
+        # Playback controls
         h_pb = QHBoxLayout()
+        btn_first = QPushButton("◀◀")
+        btn_first.setFixedWidth(30)
+        btn_first.clicked.connect(self._preview_go_first)
+        h_pb.addWidget(btn_first)
+        btn_prev = QPushButton("◀")
+        btn_prev.setFixedWidth(24)
+        btn_prev.clicked.connect(self._preview_go_prev)
+        h_pb.addWidget(btn_prev)
         self.btn_play = QPushButton("▶ Play")
         self.btn_play.setCheckable(True)
         self.btn_play.toggled.connect(self._on_play_toggled)
         h_pb.addWidget(self.btn_play)
+        btn_next = QPushButton("▶")
+        btn_next.setFixedWidth(24)
+        btn_next.clicked.connect(self._preview_go_next)
+        h_pb.addWidget(btn_next)
+        btn_last = QPushButton("▶▶")
+        btn_last.setFixedWidth(30)
+        btn_last.clicked.connect(self._preview_go_last)
+        h_pb.addWidget(btn_last)
         h_pb.addWidget(QLabel("FPS:"))
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(1, 24)
         self.spin_fps.setValue(8)
+        self.spin_fps.valueChanged.connect(
+            lambda v: self._preview_anim_timer.setInterval(max(1, 1000 // v))
+            if self._preview_anim_timer.isActive() else None)
         h_pb.addWidget(self.spin_fps)
+        self.preview_frame_lbl = QLabel("0 / 0")
+        self.preview_frame_lbl.setFixedWidth(44)
+        h_pb.addWidget(self.preview_frame_lbl)
         h_pb.addStretch()
         gv.addLayout(h_pb)
 
@@ -518,7 +583,6 @@ class FrmBrowserTab(QWidget):
         path = item.data(Qt.ItemDataRole.UserRole)
         if not path:
             return
-        # find FrmEntry from catalog
         entry = next((e for e in self._catalog.entries if e.path == path), None)
         if entry is None:
             return
@@ -526,17 +590,40 @@ class FrmBrowserTab(QWidget):
         self.preview_name_lbl.setText(entry.filename)
         self.preview_meta_lbl.setText(
             f"{entry.type_label} · {entry.char_label} · {entry.anim_label}")
-        dirs = _frm_all_dirs_first_frame(entry.path, self._pal)
-        self._preview_dirs = dirs or []
-        self._preview_frame_idx = 0
-        for i, cell in enumerate(self._preview_cells):
-            cell.set_frame(self._preview_dirs[i] if i < len(self._preview_dirs) else None)
+
+        # Stop any running playback before loading new frames
+        self._preview_anim_timer.stop()
+        self.btn_play.blockSignals(True)
+        self.btn_play.setChecked(False)
+        self.btn_play.setText("▶ Play")
+        self.btn_play.blockSignals(False)
+
+        frames = _frm_all_frames_rgb(entry.path, self._pal)
+        self._preview_frames = frames
+        self._preview_n_frames = int(frames.shape[1]) if frames is not None else 0
+        self._preview_frame = 0
+        self._refresh_preview_cells(0)
         self.btn_load.setEnabled(True)
 
+    def _refresh_preview_cells(self, frame_idx: int):
+        frames = self._preview_frames
+        fi = max(0, min(frame_idx, self._preview_n_frames - 1)) \
+            if self._preview_n_frames > 0 else 0
+        for d, cell in enumerate(self._preview_cells):
+            if frames is not None and d < frames.shape[0]:
+                cell.set_frame(frames[d, fi])
+            else:
+                cell.set_frame(None)
+        n = self._preview_n_frames
+        self.preview_frame_lbl.setText(f"{fi + 1} / {n}" if n > 0 else "— / —")
+
     def _on_play_toggled(self, playing: bool):
-        # Decorative animation — flashes between dirs since we only decoded
-        # frame 0 cheaply.  Real playback happens once loaded into pipeline.
         if playing:
+            if self._preview_n_frames == 0:
+                self.btn_play.blockSignals(True)
+                self.btn_play.setChecked(False)
+                self.btn_play.blockSignals(False)
+                return
             self.btn_play.setText("⏸ Pause")
             self._preview_anim_timer.start(max(1, 1000 // self.spin_fps.value()))
         else:
@@ -544,15 +631,38 @@ class FrmBrowserTab(QWidget):
             self._preview_anim_timer.stop()
 
     def _preview_tick(self):
-        if not self._preview_dirs:
+        if self._preview_frames is None or self._preview_n_frames == 0:
+            self.btn_play.setChecked(False)
             return
-        # Cycle highlight by hiding all but one cell briefly
-        self._preview_frame_idx = (self._preview_frame_idx + 1) % 6
-        for i, cell in enumerate(self._preview_cells):
-            cell.setStyleSheet(
-                "QFrame { border: 2px solid #ffdd00; }"
-                if i == self._preview_frame_idx else
-                "QFrame { border: 1px solid #444; }")
+        self._preview_frame = (self._preview_frame + 1) % self._preview_n_frames
+        self._refresh_preview_cells(self._preview_frame)
+
+    def _preview_go_first(self):
+        self._preview_anim_timer.stop()
+        self.btn_play.blockSignals(True)
+        self.btn_play.setChecked(False)
+        self.btn_play.setText("▶ Play")
+        self.btn_play.blockSignals(False)
+        self._preview_frame = 0
+        self._refresh_preview_cells(0)
+
+    def _preview_go_last(self):
+        self._preview_anim_timer.stop()
+        self.btn_play.blockSignals(True)
+        self.btn_play.setChecked(False)
+        self.btn_play.setText("▶ Play")
+        self.btn_play.blockSignals(False)
+        self._preview_frame = max(0, self._preview_n_frames - 1)
+        self._refresh_preview_cells(self._preview_frame)
+
+    def _preview_go_prev(self):
+        self._preview_frame = max(0, self._preview_frame - 1)
+        self._refresh_preview_cells(self._preview_frame)
+
+    def _preview_go_next(self):
+        self._preview_frame = min(
+            max(0, self._preview_n_frames - 1), self._preview_frame + 1)
+        self._refresh_preview_cells(self._preview_frame)
 
     # ------------------------------------------------------------------
     # Load into pipeline
