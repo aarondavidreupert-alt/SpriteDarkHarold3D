@@ -55,6 +55,7 @@ class CharacterData:
     color: Tuple[float, float, float] = (1.0, 0.8, 0.2)
     skeleton: Optional[object] = None               # SkeletonBuilder instance
     voxel_carver: Optional[object] = None           # VoxelCarver instance (Tab 7c)
+    frames_backup: Optional[np.ndarray] = None      # pre-shadow-removal backup
 
     @property
     def n_frames(self) -> int:

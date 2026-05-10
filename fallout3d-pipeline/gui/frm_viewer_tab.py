@@ -24,6 +24,7 @@ import frmpixels as _frmpixels
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QGroupBox, QGridLayout, QFrame, QSplitter, QSpinBox,
+    QRadioButton, QButtonGroup, QMessageBox,
 )
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -205,6 +206,57 @@ class FrmViewerTab(QWidget):
         pb_l.addWidget(self._frame_lbl)
         ll.addWidget(pb_box)
 
+        # Shadow Removal
+        shadow_box = QGroupBox("Shadow Removal")
+        sv = QVBoxLayout(shadow_box)
+
+        thr_row = QHBoxLayout()
+        thr_row.addWidget(QLabel("Threshold:"))
+        self._shadow_thresh_slider = QSlider(Qt.Orientation.Horizontal)
+        self._shadow_thresh_slider.setRange(0, 80)
+        self._shadow_thresh_slider.setValue(30)
+        self._shadow_thresh_lbl = QLabel("30")
+        self._shadow_thresh_lbl.setFixedWidth(28)
+        self._shadow_thresh_slider.valueChanged.connect(
+            lambda v: self._shadow_thresh_lbl.setText(str(v)))
+        thr_row.addWidget(self._shadow_thresh_slider, 1)
+        thr_row.addWidget(self._shadow_thresh_lbl)
+        sv.addLayout(thr_row)
+
+        blur_row = QHBoxLayout()
+        blur_row.addWidget(QLabel("Blur:"))
+        self._shadow_blur_spin = QSpinBox()
+        self._shadow_blur_spin.setRange(1, 15)
+        self._shadow_blur_spin.setSingleStep(2)
+        self._shadow_blur_spin.setValue(5)
+        self._shadow_blur_spin.setSuffix(" px")
+        blur_row.addWidget(self._shadow_blur_spin)
+        blur_row.addStretch()
+        sv.addLayout(blur_row)
+
+        scope_row = QHBoxLayout()
+        self._shadow_scope_current = QRadioButton("Current frame")
+        self._shadow_scope_all = QRadioButton("All frames")
+        self._shadow_scope_all.setChecked(True)
+        _sg = QButtonGroup(self)
+        _sg.addButton(self._shadow_scope_current)
+        _sg.addButton(self._shadow_scope_all)
+        scope_row.addWidget(self._shadow_scope_current)
+        scope_row.addWidget(self._shadow_scope_all)
+        scope_row.addStretch()
+        sv.addLayout(scope_row)
+
+        btn_row = QHBoxLayout()
+        self._btn_remove_shadow = QPushButton("Remove Shadow")
+        self._btn_remove_shadow.clicked.connect(self._remove_shadow)
+        btn_row.addWidget(self._btn_remove_shadow)
+        self._btn_restore_shadow = QPushButton("Restore Original")
+        self._btn_restore_shadow.clicked.connect(self._restore_shadow)
+        btn_row.addWidget(self._btn_restore_shadow)
+        sv.addLayout(btn_row)
+
+        ll.addWidget(shadow_box)
+
         # Canvas size control
         canvas_box = QGroupBox("Canvas Size")
         canvas_l = QVBoxLayout(canvas_box)
@@ -310,6 +362,91 @@ class FrmViewerTab(QWidget):
         char = self.state.current_character
         if char:
             self.state.set_frame(min(char.n_frames - 1, self.state.current_frame + 1))
+
+    # ------------------------------------------------------------------
+    # Shadow removal
+    # ------------------------------------------------------------------
+
+    def _remove_shadow(self):
+        try:
+            from scipy.ndimage import median_filter, binary_closing
+        except ImportError:
+            QMessageBox.warning(self, "Missing dependency",
+                                "scipy is required for shadow removal.\n"
+                                "Install with: pip install scipy")
+            return
+
+        char = self.state.current_character
+        if char is None:
+            self._status_lbl.setText("No character loaded.")
+            return
+
+        if char.frames_backup is None:
+            char.frames_backup = char.frames.copy()
+
+        threshold   = self._shadow_thresh_slider.value()
+        blur_radius = self._shadow_blur_spin.value()
+        all_frames  = self._shadow_scope_all.isChecked()
+
+        frames = char.frames  # (6, N, H, W, 3) uint8
+        n_dirs, n_frames = frames.shape[:2]
+        frame_indices = list(range(n_frames)) if all_frames else [self.state.current_frame]
+
+        # Median border colour used as fill for each dir × frame
+        border_px = max(4, frames.shape[2] // 20)
+
+        for d in range(n_dirs):
+            for fi in frame_indices:
+                img = frames[d, fi].astype(np.float32)   # (H, W, 3)
+
+                # Grayscale luminance
+                gray = (0.299 * img[:, :, 0] +
+                        0.587 * img[:, :, 1] +
+                        0.114 * img[:, :, 2])
+
+                # Local background estimate via median filter
+                bg = median_filter(gray, size=blur_radius).astype(np.float32)
+
+                # Shadow mask: dark AND darker than local background
+                mask = (gray < threshold) & ((bg - gray) > 10)
+
+                # Morphological closing to fill holes
+                mask = binary_closing(mask, iterations=2)
+
+                if not mask.any():
+                    continue
+
+                # Border median colour as fill
+                h, w = img.shape[:2]
+                border = np.concatenate([
+                    img[:border_px, :].reshape(-1, 3),
+                    img[-border_px:, :].reshape(-1, 3),
+                    img[:, :border_px].reshape(-1, 3),
+                    img[:, -border_px:].reshape(-1, 3),
+                ], axis=0)
+                fill = np.median(border, axis=0).astype(np.uint8)
+
+                result = frames[d, fi].copy()
+                result[mask] = fill
+                frames[d, fi] = result
+
+        n_proc = len(frame_indices)
+        self.state.character_updated.emit(self.state.selected_idx)
+        self._status_lbl.setText(
+            f"Shadow removed ({n_proc} frame{'s' if n_proc != 1 else ''} × {n_dirs} dirs).")
+
+    def _restore_shadow(self):
+        char = self.state.current_character
+        if char is None:
+            self._status_lbl.setText("No character loaded.")
+            return
+        if char.frames_backup is None:
+            self._status_lbl.setText("No backup available.")
+            return
+        char.frames = char.frames_backup.copy()
+        char.frames_backup = None
+        self.state.character_updated.emit(self.state.selected_idx)
+        self._status_lbl.setText("Original frames restored.")
 
     # ------------------------------------------------------------------
     # Canvas recomposite
