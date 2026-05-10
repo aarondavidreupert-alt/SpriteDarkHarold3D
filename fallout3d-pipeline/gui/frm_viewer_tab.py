@@ -34,6 +34,28 @@ from gui.main_window import AppState
 _DIR_NAMES = ["NE", "E", "SE", "SW", "W", "NW"]
 
 
+def _flood_fill_mask(grid: np.ndarray, sx: int, sy: int,
+                     target: int) -> np.ndarray:
+    """
+    4-connected iterative flood fill on a 2-D uint8 palette-index array.
+    Returns a boolean mask of all pixels reachable from (sx, sy) with value == target.
+    """
+    H, W = grid.shape
+    mask = np.zeros((H, W), dtype=bool)
+    if grid[sy, sx] != target:
+        return mask
+    stack = [(sx, sy)]
+    while stack:
+        x, y = stack.pop()
+        if x < 0 or x >= W or y < 0 or y >= H:
+            continue
+        if mask[y, x] or grid[y, x] != target:
+            continue
+        mask[y, x] = True
+        stack.extend([(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)])
+    return mask
+
+
 def _to_pixmap(img: np.ndarray, max_side: int = 220) -> QPixmap:
     """RGB (H, W, 3) uint8 ndarray → scaled QPixmap."""
     if img.dtype != np.uint8:
@@ -58,7 +80,8 @@ def _to_pixmap(img: np.ndarray, max_side: int = 220) -> QPixmap:
 
 class _DirCell(QFrame):
     """One cell in the 2×3 grid.  Shows current frame for one direction."""
-    selected_signal = pyqtSignal(int)   # dir_idx
+    selected_signal = pyqtSignal(int)          # dir_idx (click-to-select)
+    pixel_clicked   = pyqtSignal(int, float, float)  # dir_idx, x_frac, y_frac
 
     def __init__(self, dir_idx: int, parent=None):
         super().__init__(parent)
@@ -97,6 +120,12 @@ class _DirCell(QFrame):
 
     def mousePressEvent(self, event):
         self.selected_signal.emit(self.dir_idx)
+        local = self._img.mapFrom(self, event.position().toPoint())
+        lbl_rect = self._img.rect()
+        if lbl_rect.width() > 0 and lbl_rect.height() > 0:
+            xf = max(0.0, min(1.0, local.x() / lbl_rect.width()))
+            yf = max(0.0, min(1.0, local.y() / lbl_rect.height()))
+            self.pixel_clicked.emit(self.dir_idx, xf, yf)
         super().mousePressEvent(event)
 
 
@@ -206,36 +235,20 @@ class FrmViewerTab(QWidget):
         pb_l.addWidget(self._frame_lbl)
         ll.addWidget(pb_box)
 
-        # Shadow Removal
+        # Paint-bucket shadow removal
         shadow_box = QGroupBox("Shadow Removal")
         sv = QVBoxLayout(shadow_box)
 
-        thr_row = QHBoxLayout()
-        thr_row.addWidget(QLabel("Threshold:"))
-        self._shadow_thresh_slider = QSlider(Qt.Orientation.Horizontal)
-        self._shadow_thresh_slider.setRange(0, 80)
-        self._shadow_thresh_slider.setValue(30)
-        self._shadow_thresh_lbl = QLabel("30")
-        self._shadow_thresh_lbl.setFixedWidth(28)
-        self._shadow_thresh_slider.valueChanged.connect(
-            lambda v: self._shadow_thresh_lbl.setText(str(v)))
-        thr_row.addWidget(self._shadow_thresh_slider, 1)
-        thr_row.addWidget(self._shadow_thresh_lbl)
-        sv.addLayout(thr_row)
-
-        blur_row = QHBoxLayout()
-        blur_row.addWidget(QLabel("Blur:"))
-        self._shadow_blur_spin = QSpinBox()
-        self._shadow_blur_spin.setRange(1, 15)
-        self._shadow_blur_spin.setSingleStep(2)
-        self._shadow_blur_spin.setValue(5)
-        self._shadow_blur_spin.setSuffix(" px")
-        blur_row.addWidget(self._shadow_blur_spin)
-        blur_row.addStretch()
-        sv.addLayout(blur_row)
+        self._btn_shadow_mode = QPushButton("🪣 Shadow Removal: OFF")
+        self._btn_shadow_mode.setCheckable(True)
+        self._btn_shadow_mode.setToolTip(
+            "Click a shadow pixel on any frame to flood-fill it\n"
+            "with transparent (index 0).")
+        self._btn_shadow_mode.toggled.connect(self._on_shadow_mode_toggled)
+        sv.addWidget(self._btn_shadow_mode)
 
         scope_row = QHBoxLayout()
-        self._shadow_scope_current = QRadioButton("Current frame")
+        self._shadow_scope_current = QRadioButton("This frame only")
         self._shadow_scope_all = QRadioButton("All frames")
         self._shadow_scope_all.setChecked(True)
         _sg = QButtonGroup(self)
@@ -246,14 +259,9 @@ class FrmViewerTab(QWidget):
         scope_row.addStretch()
         sv.addLayout(scope_row)
 
-        btn_row = QHBoxLayout()
-        self._btn_remove_shadow = QPushButton("Remove Shadow")
-        self._btn_remove_shadow.clicked.connect(self._remove_shadow)
-        btn_row.addWidget(self._btn_remove_shadow)
-        self._btn_restore_shadow = QPushButton("Restore Original")
-        self._btn_restore_shadow.clicked.connect(self._restore_shadow)
-        btn_row.addWidget(self._btn_restore_shadow)
-        sv.addLayout(btn_row)
+        self._btn_shadow_restore = QPushButton("↩ Restore Original")
+        self._btn_shadow_restore.clicked.connect(self._restore_shadow)
+        sv.addWidget(self._btn_shadow_restore)
 
         ll.addWidget(shadow_box)
 
@@ -298,6 +306,7 @@ class FrmViewerTab(QWidget):
         for i in range(6):
             cell = _DirCell(i)
             cell.selected_signal.connect(self._select_dir)
+            cell.pixel_clicked.connect(self._on_pixel_clicked)
             grid.addWidget(cell, i // 3, i % 3)
             self._cells.append(cell)
 
@@ -364,76 +373,60 @@ class FrmViewerTab(QWidget):
             self.state.set_frame(min(char.n_frames - 1, self.state.current_frame + 1))
 
     # ------------------------------------------------------------------
-    # Shadow removal
+    # Shadow removal (paint-bucket flood fill)
     # ------------------------------------------------------------------
 
-    def _remove_shadow(self):
-        try:
-            from scipy.ndimage import median_filter, binary_closing
-        except ImportError:
-            QMessageBox.warning(self, "Missing dependency",
-                                "scipy is required for shadow removal.\n"
-                                "Install with: pip install scipy")
-            return
+    def _on_shadow_mode_toggled(self, active: bool):
+        self._btn_shadow_mode.setText(
+            "🪣 Shadow Removal: ON" if active else "🪣 Shadow Removal: OFF")
+        cursor = Qt.CursorShape.CrossCursor if active else Qt.CursorShape.ArrowCursor
+        for cell in self._cells:
+            cell.setCursor(cursor)
 
+    def _on_pixel_clicked(self, dir_idx: int, xf: float, yf: float):
+        if not self._btn_shadow_mode.isChecked():
+            return
         char = self.state.current_character
         if char is None:
-            self._status_lbl.setText("No character loaded.")
+            return
+        if char.frames_pal_idx is None:
+            self._status_lbl.setText(
+                "Shadow removal needs a .frm source. Re-load as .frm.")
             return
 
+        fi = self.state.current_frame
+        frame_pal = char.frames_pal_idx[dir_idx, fi]   # (H, W) uint8
+        H, W = frame_pal.shape
+        px = max(0, min(int(xf * W), W - 1))
+        py = max(0, min(int(yf * H), H - 1))
+        target_idx = int(frame_pal[py, px])
+        if target_idx == 0:
+            self._status_lbl.setText("Clicked background (index 0) — nothing to do.")
+            return
+
+        # Backup before first modification
         if char.frames_backup is None:
-            char.frames_backup = char.frames.copy()
+            char.frames_backup         = char.frames.copy()
+            char.frames_pal_idx_backup = char.frames_pal_idx.copy()
 
-        threshold   = self._shadow_thresh_slider.value()
-        blur_radius = self._shadow_blur_spin.value()
-        all_frames  = self._shadow_scope_all.isChecked()
+        if self._shadow_scope_all.isChecked():
+            n_dirs   = char.frames_pal_idx.shape[0]
+            n_frames = char.frames_pal_idx.shape[1]
+            targets  = [(d, f) for d in range(n_dirs) for f in range(n_frames)]
+        else:
+            targets = [(dir_idx, fi)]
 
-        frames = char.frames  # (6, N, H, W, 3) uint8
-        n_dirs, n_frames = frames.shape[:2]
-        frame_indices = list(range(n_frames)) if all_frames else [self.state.current_frame]
+        for d, f in targets:
+            mask = _flood_fill_mask(char.frames_pal_idx[d, f], px, py, target_idx)
+            if not mask.any():
+                continue
+            char.frames_pal_idx[d, f][mask] = 0
+            char.frames[d, f][mask] = 0   # black in RGB
 
-        # Median border colour used as fill for each dir × frame
-        border_px = max(4, frames.shape[2] // 20)
-
-        for d in range(n_dirs):
-            for fi in frame_indices:
-                img = frames[d, fi].astype(np.float32)   # (H, W, 3)
-
-                # Grayscale luminance
-                gray = (0.299 * img[:, :, 0] +
-                        0.587 * img[:, :, 1] +
-                        0.114 * img[:, :, 2])
-
-                # Local background estimate via median filter
-                bg = median_filter(gray, size=blur_radius).astype(np.float32)
-
-                # Shadow mask: dark AND darker than local background
-                mask = (gray < threshold) & ((bg - gray) > 10)
-
-                # Morphological closing to fill holes
-                mask = binary_closing(mask, iterations=2)
-
-                if not mask.any():
-                    continue
-
-                # Border median colour as fill
-                h, w = img.shape[:2]
-                border = np.concatenate([
-                    img[:border_px, :].reshape(-1, 3),
-                    img[-border_px:, :].reshape(-1, 3),
-                    img[:, :border_px].reshape(-1, 3),
-                    img[:, -border_px:].reshape(-1, 3),
-                ], axis=0)
-                fill = np.median(border, axis=0).astype(np.uint8)
-
-                result = frames[d, fi].copy()
-                result[mask] = fill
-                frames[d, fi] = result
-
-        n_proc = len(frame_indices)
+        scope = "all frames" if self._shadow_scope_all.isChecked() else "this frame"
         self.state.character_updated.emit(self.state.selected_idx)
         self._status_lbl.setText(
-            f"Shadow removed ({n_proc} frame{'s' if n_proc != 1 else ''} × {n_dirs} dirs).")
+            f"Removed palette index {target_idx} ({scope}).")
 
     def _restore_shadow(self):
         char = self.state.current_character
@@ -444,7 +437,10 @@ class FrmViewerTab(QWidget):
             self._status_lbl.setText("No backup available.")
             return
         char.frames = char.frames_backup.copy()
-        char.frames_backup = None
+        if char.frames_pal_idx_backup is not None:
+            char.frames_pal_idx = char.frames_pal_idx_backup.copy()
+        char.frames_backup         = None
+        char.frames_pal_idx_backup = None
         self.state.character_updated.emit(self.state.selected_idx)
         self._status_lbl.setText("Original frames restored.")
 
@@ -501,7 +497,8 @@ class FrmViewerTab(QWidget):
             anchor_x = cw // 2
             anchor_y = ch * 3 // 4
 
-            new_frames = np.zeros((6, n_frames, ch, cw, 3), dtype=np.uint8)
+            new_frames  = np.zeros((6, n_frames, ch, cw, 3),  dtype=np.uint8)
+            new_pal_idx = np.zeros((6, n_frames, ch, cw),     dtype=np.uint8)
 
             for d in range(n_dirs):
                 ox, oy = 0, 0
@@ -519,11 +516,13 @@ class FrmViewerTab(QWidget):
                     sx0 = x0 - left;  sy0 = y0 - top
 
                     if x1 > x0 and y1 > y0:
-                        idx = pixels[d][fi].reshape(fh, fw)
-                        new_frames[d, fi, y0:y1, x0:x1] = \
-                            pal_table[idx[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]]
+                        raw = pixels[d][fi].reshape(fh, fw)
+                        patch = raw[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]
+                        new_frames [d, fi, y0:y1, x0:x1] = pal_table[patch]
+                        new_pal_idx[d, fi, y0:y1, x0:x1] = patch
 
-            char.frames = new_frames
+            char.frames         = new_frames
+            char.frames_pal_idx = new_pal_idx
             char.frm_offsets = None
             self.state.character_updated.emit(self.state.selected_idx)
             self._status_lbl.setText(
