@@ -153,6 +153,26 @@ class LoadWorker(QObject):
 
                 frm_offsets = None  # fixed canvas; per-frame offsets no longer needed
 
+                # Build parallel palette-index array (same loop, no RGB conversion)
+                pal_idx = np.zeros((6, n_frames, CANVAS_H, CANVAS_W), dtype=np.uint8)
+                for d in range(n_dirs):
+                    ox, oy = 0, 0
+                    for fi in range(n_frames):
+                        fo = offsets[d][fi]
+                        fw, fh = fo['w'], fo['h']
+                        ox += fo['x']
+                        oy += fo['y']
+                        left = anchor_x - (fw // 2 - ox)
+                        top  = anchor_y - (fh - oy)
+                        x0 = max(left, 0);  y0 = max(top, 0)
+                        x1 = min(left + fw, CANVAS_W)
+                        y1 = min(top + fh, CANVAS_H)
+                        sx0 = x0 - left;  sy0 = y0 - top
+                        if x1 > x0 and y1 > y0:
+                            raw = pixels[d][fi].reshape(fh, fw)
+                            pal_idx[d, fi, y0:y1, x0:x1] = \
+                                raw[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]
+
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
 
@@ -164,6 +184,8 @@ class LoadWorker(QObject):
                 frames=frames, source_path=self.path,
                 frm_offsets=frm_offsets,
             )
+            if ext == ".frm":
+                char.frames_pal_idx = pal_idx
             self.finished.emit(char)
 
         except Exception as exc:
