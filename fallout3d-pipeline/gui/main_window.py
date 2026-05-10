@@ -180,9 +180,9 @@ class MainWindow(QMainWindow):
         self.tab_mesh_export      = MeshExportTab(self.state, self)
         self.tab_export           = ExportTab(self.state, self)
 
-        self.tabs.addTab(self.tab_asset,            "1 · Asset Loader")
-        self.tabs.addTab(self.tab_frm_viewer,       "1b · FRM Viewer")
-        self.tabs.addTab(self.tab_frm_browser,      "1c · FRM Browser")
+        self.tabs.addTab(self.tab_frm_browser,      "1a · FRM Browser")
+        self.tabs.addTab(self.tab_asset,            "1b · Asset Loader")
+        self.tabs.addTab(self.tab_frm_viewer,       "1c · FRM Viewer (canvas)")
         self.tabs.addTab(self.tab_upscaler,         "2 · Upscaler")
         self.tabs.addTab(self.tab_pose,             "3 · Pose Detector")
         self.tabs.addTab(self.tab_pose_editor,      "4 · Pose Editor")
