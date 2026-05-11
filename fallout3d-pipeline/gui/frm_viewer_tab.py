@@ -25,9 +25,10 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QGroupBox, QGridLayout, QFrame, QSplitter, QSpinBox,
     QRadioButton, QButtonGroup, QMessageBox,
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
 )
-from PyQt6.QtGui import QPixmap, QImage
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QPixmap, QImage, QTransform
+from PyQt6.QtCore import Qt, QTimer, QEvent, QRectF, pyqtSignal
 
 from gui.main_window import AppState
 
@@ -78,10 +79,26 @@ def _to_pixmap(img: np.ndarray, max_side: int = 220) -> QPixmap:
     return pix
 
 
+def _to_pixmap_raw(img: np.ndarray) -> QPixmap:
+    """RGB (H, W, 3) uint8 → QPixmap at NATIVE resolution (no scaling).
+    Used by _DirCell so the QGraphicsView handles zoom itself."""
+    if img.dtype != np.uint8:
+        img = img.astype(np.uint8)
+    if not img.flags["C_CONTIGUOUS"]:
+        img = np.ascontiguousarray(img)
+    if len(img.shape) == 2:
+        img = np.stack([img] * 3, axis=-1)
+    elif img.shape[2] == 4:
+        img = img[:, :, :3]
+    h, w = img.shape[:2]
+    qimg = QImage(img.data, w, h, w * 3, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg.copy())
+
+
 class _DirCell(QFrame):
     """One cell in the 2×3 grid.  Shows current frame for one direction."""
-    selected_signal = pyqtSignal(int)          # dir_idx (click-to-select)
-    pixel_clicked   = pyqtSignal(int, float, float)  # dir_idx, x_frac, y_frac
+    selected_signal = pyqtSignal(int)               # dir_idx
+    pixel_clicked   = pyqtSignal(int, float, float) # dir_idx, x_frac, y_frac
 
     def __init__(self, dir_idx: int, parent=None):
         super().__init__(parent)
@@ -99,11 +116,33 @@ class _DirCell(QFrame):
         name_lbl.setStyleSheet("font-size: 10px; color: #aaa; border: none;")
         lay.addWidget(name_lbl)
 
-        self._img = QLabel()
-        self._img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._img.setMinimumSize(140, 140)
-        self._img.setStyleSheet("background: #0d0d0d; border: none;")
-        lay.addWidget(self._img, 1)
+        self._scene = QGraphicsScene(self)
+        self._view  = QGraphicsView(self._scene)
+        self._view.setMinimumSize(140, 140)
+        self._view.setStyleSheet("background: #0d0d0d; border: none;")
+        self._view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._view.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self._view.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self._view.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self._pix_item = QGraphicsPixmapItem()
+        self._pix_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
+        self._scene.addItem(self._pix_item)
+        lay.addWidget(self._view, 1)
+
+        # zoom / pan state
+        self._zoom_factor = 1.0
+        self._MIN_ZOOM    = 0.5
+        self._MAX_ZOOM    = 16.0
+        self._pan_active  = False
+        self._pan_start   = None
+
+        self._view.viewport().installEventFilter(self)
+        self._view.viewport().setMouseTracking(True)
+
+    # ------------------------------------------------------------------
+    # Border / selection
+    # ------------------------------------------------------------------
 
     def _set_border(self, selected: bool):
         color = "#ffdd00" if selected else "#444"
@@ -112,20 +151,117 @@ class _DirCell(QFrame):
     def set_selected(self, sel: bool):
         self._set_border(sel)
 
+    # ------------------------------------------------------------------
+    # Frame display
+    # ------------------------------------------------------------------
+
     def set_frame(self, img: np.ndarray | None):
         if img is None:
-            self._img.clear()
-        else:
-            self._img.setPixmap(_to_pixmap(img))
+            self._pix_item.setPixmap(QPixmap())
+            self._scene.setSceneRect(QRectF())
+            return
+        pix = _to_pixmap_raw(img)
+        self._pix_item.setPixmap(pix)
+        self._scene.setSceneRect(QRectF(pix.rect()))
+        self._fit_in_view()
+
+    def _fit_in_view(self):
+        """Reset zoom/pan so the full sprite fits the cell."""
+        sr = self._scene.sceneRect()
+        if sr.isEmpty():
+            return
+        vr = self._view.viewport().rect()
+        if vr.width() == 0 or vr.height() == 0:
+            return
+        sx = vr.width()  / sr.width()
+        sy = vr.height() / sr.height()
+        scale = min(sx, sy)
+        self._zoom_factor = scale
+        t = QTransform()
+        t.scale(scale, scale)
+        self._view.setTransform(t)
+        self._view.centerOn(self._pix_item)
+
+    # ------------------------------------------------------------------
+    # Event filter — wheel zoom + pan + click forwarding
+    # ------------------------------------------------------------------
+
+    def eventFilter(self, obj, event):
+        if obj is not self._view.viewport():
+            return False
+
+        etype = event.type()
+
+        # ── wheel → zoom centered on cursor ───────────────────────────
+        if etype == QEvent.Type.Wheel:
+            delta = event.angleDelta().y()
+            factor = 1.15 if delta > 0 else (1.0 / 1.15)
+            new_zoom = max(self._MIN_ZOOM,
+                           min(self._MAX_ZOOM, self._zoom_factor * factor))
+            if new_zoom == self._zoom_factor:
+                return True
+            mouse_pos = event.position().toPoint()
+            scene_pos = self._view.mapToScene(mouse_pos)
+            ratio = new_zoom / self._zoom_factor
+            self._zoom_factor = new_zoom
+            t = self._view.transform()
+            t.scale(ratio, ratio)
+            self._view.setTransform(t)
+            new_scene_pos = self._view.mapToScene(mouse_pos)
+            delta_scene = new_scene_pos - scene_pos
+            self._view.translate(delta_scene.x(), delta_scene.y())
+            return True
+
+        # ── middle-button press → start pan ───────────────────────────
+        if (etype == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.MiddleButton):
+            self._pan_active = True
+            self._pan_start  = event.position().toPoint()
+            self._view.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            return True
+
+        # ── mouse move → pan ──────────────────────────────────────────
+        if etype == QEvent.Type.MouseMove and self._pan_active:
+            delta = event.position().toPoint() - self._pan_start
+            self._pan_start = event.position().toPoint()
+            self._view.translate(
+                delta.x() / self._zoom_factor,
+                delta.y() / self._zoom_factor,
+            )
+            return True
+
+        # ── middle-button release → stop pan ──────────────────────────
+        if (etype == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.MiddleButton):
+            self._pan_active = False
+            self._view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            return True
+
+        # ── double left-click → reset zoom ────────────────────────────
+        if (etype == QEvent.Type.MouseButtonDblClick
+                and event.button() == Qt.MouseButton.LeftButton):
+            self._fit_in_view()
+            return True
+
+        # ── left-click → select cell + pixel_clicked ──────────────────
+        if (etype == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton):
+            self.selected_signal.emit(self.dir_idx)
+            vp_pt = event.position().toPoint()
+            scene_pt = self._view.mapToScene(vp_pt)
+            sr = self._scene.sceneRect()
+            if sr.width() > 0 and sr.height() > 0:
+                xf = max(0.0, min(1.0, scene_pt.x() / sr.width()))
+                yf = max(0.0, min(1.0, scene_pt.y() / sr.height()))
+                self.pixel_clicked.emit(self.dir_idx, xf, yf)
+            return False  # let event propagate
+
+        return False
 
     def mousePressEvent(self, event):
+        # Frame-level press — just ensures selection if the viewport
+        # event was somehow not caught.
         self.selected_signal.emit(self.dir_idx)
-        local = self._img.mapFrom(self, event.position().toPoint())
-        lbl_rect = self._img.rect()
-        if lbl_rect.width() > 0 and lbl_rect.height() > 0:
-            xf = max(0.0, min(1.0, local.x() / lbl_rect.width()))
-            yf = max(0.0, min(1.0, local.y() / lbl_rect.height()))
-            self.pixel_clicked.emit(self.dir_idx, xf, yf)
         super().mousePressEvent(event)
 
 
@@ -235,6 +371,17 @@ class FrmViewerTab(QWidget):
         pb_l.addWidget(self._frame_lbl)
         ll.addWidget(pb_box)
 
+        # View controls (zoom reset)
+        view_box = QGroupBox("View")
+        view_l = QVBoxLayout(view_box)
+        self._btn_reset_zoom = QPushButton("⊡ Reset Zoom (all cells)")
+        self._btn_reset_zoom.setToolTip(
+            "Double-click any cell to reset that cell.\n"
+            "This button resets all 6 at once.")
+        self._btn_reset_zoom.clicked.connect(self._reset_all_zoom)
+        view_l.addWidget(self._btn_reset_zoom)
+        ll.addWidget(view_box)
+
         # Paint-bucket shadow removal
         shadow_box = QGroupBox("Shadow Removal")
         sv = QVBoxLayout(shadow_box)
@@ -326,6 +473,14 @@ class FrmViewerTab(QWidget):
         self._refresh_status()
 
     # ------------------------------------------------------------------
+    # Zoom reset
+    # ------------------------------------------------------------------
+
+    def _reset_all_zoom(self):
+        for cell in self._cells:
+            cell._fit_in_view()
+
+    # ------------------------------------------------------------------
     # Playback
     # ------------------------------------------------------------------
 
@@ -381,7 +536,7 @@ class FrmViewerTab(QWidget):
             "🪣 Shadow Removal: ON" if active else "🪣 Shadow Removal: OFF")
         cursor = Qt.CursorShape.CrossCursor if active else Qt.CursorShape.ArrowCursor
         for cell in self._cells:
-            cell.setCursor(cursor)
+            cell._view.viewport().setCursor(cursor)
 
     def _on_pixel_clicked(self, dir_idx: int, xf: float, yf: float):
         if not self._btn_shadow_mode.isChecked():
