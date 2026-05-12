@@ -24,7 +24,7 @@ import frmpixels as _frmpixels
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QGroupBox, QGridLayout, QFrame, QSplitter, QSpinBox,
-    QRadioButton, QButtonGroup, QMessageBox,
+    QRadioButton, QButtonGroup, QMessageBox, QScrollArea,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
 )
 from PyQt6.QtGui import QPixmap, QImage, QTransform
@@ -119,6 +119,7 @@ class _DirCell(QFrame):
         self._scene = QGraphicsScene(self)
         self._view  = QGraphicsView(self._scene)
         self._view.setMinimumSize(140, 140)
+        self._bg_color = "#0d0d0d"
         self._view.setStyleSheet("background: #0d0d0d; border: none;")
         self._view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -150,6 +151,10 @@ class _DirCell(QFrame):
 
     def set_selected(self, sel: bool):
         self._set_border(sel)
+
+    def set_bg_color(self, hex_color: str):
+        self._bg_color = hex_color
+        self._view.setStyleSheet(f"background: {hex_color}; border: none;")
 
     # ------------------------------------------------------------------
     # Frame display
@@ -279,6 +284,7 @@ class FrmViewerTab(QWidget):
         self._play_timer.timeout.connect(self._play_tick)
         self._build_ui()
         self._select_dir(0)
+        self._removed_colors: dict[int, tuple[int, int, int]] = {}
 
         self.state.selection_changed.connect(self._on_char_changed)
         self.state.frame_changed.connect(self._on_frame_changed)
@@ -380,6 +386,19 @@ class FrmViewerTab(QWidget):
             "This button resets all 6 at once.")
         self._btn_reset_zoom.clicked.connect(self._reset_all_zoom)
         view_l.addWidget(self._btn_reset_zoom)
+
+        bg_row = QHBoxLayout()
+        bg_row.addWidget(QLabel("BG:"))
+        for label, color in [("⬛ Black", "#0d0d0d"),
+                              ("🟦 Blue",  "#0a1a3a"),
+                              ("🟩 Green", "#0a2a0a")]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(24)
+            btn.clicked.connect(
+                lambda _checked, c=color: self._set_bg_color(c)
+            )
+            bg_row.addWidget(btn)
+        view_l.addLayout(bg_row)
         ll.addWidget(view_box)
 
         # Paint-bucket shadow removal
@@ -409,6 +428,22 @@ class FrmViewerTab(QWidget):
         self._btn_shadow_restore = QPushButton("↩ Restore Original")
         self._btn_shadow_restore.clicked.connect(self._restore_shadow)
         sv.addWidget(self._btn_shadow_restore)
+
+        sv.addWidget(QLabel("Removed colours:"))
+        self._swatch_scroll = QScrollArea()
+        self._swatch_scroll.setWidgetResizable(True)
+        self._swatch_scroll.setFixedHeight(72)
+        self._swatch_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._swatch_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._swatch_inner = QWidget()
+        self._swatch_layout = QHBoxLayout(self._swatch_inner)
+        self._swatch_layout.setContentsMargins(2, 2, 2, 2)
+        self._swatch_layout.setSpacing(4)
+        self._swatch_layout.addStretch()
+        self._swatch_scroll.setWidget(self._swatch_inner)
+        sv.addWidget(self._swatch_scroll)
 
         ll.addWidget(shadow_box)
 
@@ -479,6 +514,47 @@ class FrmViewerTab(QWidget):
     def _reset_all_zoom(self):
         for cell in self._cells:
             cell._fit_in_view()
+
+    def _set_bg_color(self, hex_color: str):
+        for cell in self._cells:
+            cell.set_bg_color(hex_color)
+
+    # ------------------------------------------------------------------
+    # Removed-colours swatch helpers
+    # ------------------------------------------------------------------
+
+    def _get_pal_table(self) -> np.ndarray | None:
+        """Return the 256×3 uint8 palette table, or None on failure."""
+        try:
+            if not os.path.exists(_PAL_PATH):
+                return None
+            with open(_PAL_PATH, "rb") as f:
+                return np.array(
+                    [(r, g, b) for r, g, b in _pal_mod.readPAL(f)],
+                    dtype=np.uint8,
+                )
+        except Exception:
+            return None
+
+    def _add_swatch(self, pal_idx: int, rgb: tuple[int, int, int]):
+        """Add a colour chip to the removed-colours panel if not already present."""
+        if pal_idx in self._removed_colors:
+            return
+        self._removed_colors[pal_idx] = rgb
+        r, g, b = rgb
+        chip = QLabel()
+        chip.setFixedSize(36, 52)
+        chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        chip.setToolTip(f"Palette index: {pal_idx}\nRGB: ({r}, {g}, {b})")
+        chip.setStyleSheet(
+            f"background: rgb({r},{g},{b});"
+            f"border: 1px solid #555;"
+            f"color: {'#000' if (r + g + b) > 380 else '#fff'};"
+            f"font-size: 9px;"
+        )
+        chip.setText(f"#{pal_idx}" if pal_idx >= 0 else "orph")
+        count = self._swatch_layout.count()
+        self._swatch_layout.insertWidget(count - 1, chip)
 
     # ------------------------------------------------------------------
     # Playback
@@ -583,6 +659,13 @@ class FrmViewerTab(QWidget):
         self._status_lbl.setText(
             f"Removed palette index {target_idx} ({scope}).")
 
+        pal_table = self._get_pal_table()
+        if pal_table is not None and target_idx < len(pal_table):
+            rgb = tuple(int(v) for v in pal_table[target_idx])
+        else:
+            rgb = (80, 80, 80)
+        self._add_swatch(target_idx, rgb)
+
     def _restore_shadow(self):
         char = self.state.current_character
         if char is None:
@@ -598,6 +681,12 @@ class FrmViewerTab(QWidget):
         char.frames_pal_idx_backup = None
         self.state.character_updated.emit(self.state.selected_idx)
         self._status_lbl.setText("Original frames restored.")
+
+        self._removed_colors.clear()
+        while self._swatch_layout.count() > 1:
+            item = self._swatch_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
     # ------------------------------------------------------------------
     # Canvas recomposite
