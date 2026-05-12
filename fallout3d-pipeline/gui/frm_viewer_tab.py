@@ -850,6 +850,13 @@ class FrmViewerTab(QWidget):
                         new_frames [d, fi, y0:y1, x0:x1] = pal_table[patch]
                         new_pal_idx[d, fi, y0:y1, x0:x1] = patch
 
+            # Preserve shadow/orphan edits for this direction
+            if (char.frames_pal_idx is not None
+                    and char.frames_pal_idx.shape == new_pal_idx.shape):
+                old_erased = (char.frames_pal_idx[d] == 0)   # (n_frames, H, W)
+                new_pal_idx[d][old_erased] = 0
+                new_frames[d][old_erased]  = 0
+
             char.frames         = new_frames
             char.frames_pal_idx = new_pal_idx
             char.frm_offsets = None

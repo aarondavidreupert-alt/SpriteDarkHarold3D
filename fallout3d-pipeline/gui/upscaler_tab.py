@@ -201,6 +201,14 @@ class UpscalerTab(QWidget):
         self._btn_run.clicked.connect(self._run)
         row1.addWidget(self._btn_run)
 
+        self._btn_force_run = QPushButton("⟳ Force Re-run")
+        self._btn_force_run.setToolTip(
+            "Delete the .npy cache and re-upscale from the current\n"
+            "frames (including any shadow/orphan edits already applied)."
+        )
+        self._btn_force_run.clicked.connect(self._force_run)
+        row1.addWidget(self._btn_force_run)
+
         row1.addStretch()
         ctrl_lay.addLayout(row1)
 
@@ -297,6 +305,7 @@ class UpscalerTab(QWidget):
         total      = char.frames.shape[0] * char.frames.shape[1]
 
         self._btn_run.setEnabled(False)
+        self._btn_force_run.setEnabled(False)
         self._progress.setRange(0, total)
         self._progress.setValue(0)
         self._progress.setVisible(True)
@@ -316,6 +325,23 @@ class UpscalerTab(QWidget):
         self._worker.error.connect(self._on_error)
         self._thread.start()
 
+    def _force_run(self):
+        char = self.state.current_character
+        if char is None:
+            self._status_lbl.setText("No character loaded.")
+            return
+        backend  = self._backend_combo.currentData()
+        cache_fp = _cache_path(char, backend)
+        if os.path.exists(cache_fp):
+            try:
+                os.remove(cache_fp)
+                self._status_lbl.setText(
+                    f"Cache deleted: {os.path.basename(cache_fp)}")
+            except Exception as exc:
+                self._status_lbl.setText(f"Could not delete cache: {exc}")
+                return
+        self._run()
+
     def _on_progress(self, done: int, total: int, msg: str):
         self._progress.setValue(done)
         self._status_lbl.setText(msg)
@@ -323,6 +349,7 @@ class UpscalerTab(QWidget):
     def _on_finished(self, result: np.ndarray):
         self._thread.quit()
         self._btn_run.setEnabled(True)
+        self._btn_force_run.setEnabled(True)
         self._progress.setVisible(False)
         self._upscaled = result
 
@@ -342,6 +369,7 @@ class UpscalerTab(QWidget):
     def _on_error(self, msg: str):
         self._thread.quit()
         self._btn_run.setEnabled(True)
+        self._btn_force_run.setEnabled(True)
         self._progress.setVisible(False)
         self._status_lbl.setText(f"Error: {msg[:200]}")
 
