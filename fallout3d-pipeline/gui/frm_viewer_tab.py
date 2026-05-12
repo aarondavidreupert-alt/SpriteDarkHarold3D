@@ -79,7 +79,10 @@ def _to_pixmap(img: np.ndarray, max_side: int = 220) -> QPixmap:
     return pix
 
 
-def _to_pixmap_raw(img: np.ndarray) -> QPixmap:
+def _to_pixmap_raw(
+    img: np.ndarray,
+    bg_rgb: tuple[int, int, int] = (13, 13, 13),
+) -> QPixmap:
     """RGB (H, W, 3) uint8 → QPixmap at NATIVE resolution (no scaling).
     Used by _DirCell so the QGraphicsView handles zoom itself."""
     if img.dtype != np.uint8:
@@ -90,6 +93,13 @@ def _to_pixmap_raw(img: np.ndarray) -> QPixmap:
         img = np.stack([img] * 3, axis=-1)
     elif img.shape[2] == 4:
         img = img[:, :, :3]
+    # Composite sprite over background colour (display-only, no mutation)
+    if bg_rgb != (0, 0, 0):
+        bg_mask = np.all(img == 0, axis=2)   # True where pixel is black bg
+        canvas = np.empty_like(img)
+        canvas[:] = bg_rgb
+        canvas[~bg_mask] = img[~bg_mask]
+        img = canvas
     h, w = img.shape[:2]
     qimg = QImage(img.data, w, h, w * 3, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qimg.copy())
@@ -120,6 +130,7 @@ class _DirCell(QFrame):
         self._view  = QGraphicsView(self._scene)
         self._view.setMinimumSize(140, 140)
         self._bg_color = "#0d0d0d"
+        self._bg_rgb: tuple[int, int, int] = (13, 13, 13)
         self._view.setStyleSheet("background: #0d0d0d; border: none;")
         self._view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -130,6 +141,9 @@ class _DirCell(QFrame):
         self._pix_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
         self._scene.addItem(self._pix_item)
         lay.addWidget(self._view, 1)
+
+        # last raw frame array (for bg re-render)
+        self._last_img: np.ndarray | None = None
 
         # zoom / pan state
         self._zoom_factor = 1.0
@@ -155,20 +169,35 @@ class _DirCell(QFrame):
     def set_bg_color(self, hex_color: str):
         self._bg_color = hex_color
         self._view.setStyleSheet(f"background: {hex_color}; border: none;")
+        h = hex_color.lstrip("#")
+        try:
+            self._bg_rgb = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+        except (ValueError, IndexError):
+            self._bg_rgb = (13, 13, 13)
+        if self._pix_item.pixmap() and not self._pix_item.pixmap().isNull():
+            self._rerender_bg()
 
     # ------------------------------------------------------------------
     # Frame display
     # ------------------------------------------------------------------
 
     def set_frame(self, img: np.ndarray | None):
+        self._last_img = img
         if img is None:
             self._pix_item.setPixmap(QPixmap())
             self._scene.setSceneRect(QRectF())
             return
-        pix = _to_pixmap_raw(img)
+        pix = _to_pixmap_raw(img, bg_rgb=self._bg_rgb)
         self._pix_item.setPixmap(pix)
         self._scene.setSceneRect(QRectF(pix.rect()))
         self._fit_in_view()
+
+    def _rerender_bg(self):
+        if self._last_img is None:
+            return
+        pix = _to_pixmap_raw(self._last_img, bg_rgb=self._bg_rgb)
+        self._pix_item.setPixmap(pix)
+        self._scene.setSceneRect(QRectF(pix.rect()))
 
     def _fit_in_view(self):
         """Reset zoom/pan so the full sprite fits the cell."""
@@ -429,6 +458,14 @@ class FrmViewerTab(QWidget):
         self._btn_shadow_restore.clicked.connect(self._restore_shadow)
         sv.addWidget(self._btn_shadow_restore)
 
+        self._btn_clean_orphans = QPushButton("✦ Remove Orphan Pixels")
+        self._btn_clean_orphans.setToolTip(
+            "Erases isolated non-background pixels with no non-background\n"
+            "4-connected neighbour. Applied to ALL frames and ALL directions."
+        )
+        self._btn_clean_orphans.clicked.connect(self._remove_orphans)
+        sv.addWidget(self._btn_clean_orphans)
+
         sv.addWidget(QLabel("Removed colours:"))
         self._swatch_scroll = QScrollArea()
         self._swatch_scroll.setWidgetResizable(True)
@@ -518,6 +555,54 @@ class FrmViewerTab(QWidget):
     def _set_bg_color(self, hex_color: str):
         for cell in self._cells:
             cell.set_bg_color(hex_color)
+
+    def _remove_orphans(self):
+        char = self.state.current_character
+        if char is None:
+            self._status_lbl.setText("No character loaded.")
+            return
+
+        if char.frames_backup is None:
+            char.frames_backup = char.frames.copy()
+            if char.frames_pal_idx is not None:
+                char.frames_pal_idx_backup = char.frames_pal_idx.copy()
+
+        frames = char.frames                      # (n_dirs, n_frames, H, W, 3)
+        n_dirs, n_frames, H, W, _ = frames.shape
+        total_removed = 0
+
+        for d in range(n_dirs):
+            for fi in range(n_frames):
+                img = frames[d, fi]               # (H, W, 3)
+                fg = np.any(img > 0, axis=2)      # foreground mask
+
+                # Count fg 4-connected neighbours per pixel
+                nb = np.zeros((H, W), dtype=np.int32)
+                nb[:-1, :] += fg[1:,  :]
+                nb[1:,  :] += fg[:-1, :]
+                nb[:, :-1] += fg[:,  1:]
+                nb[:,  1:] += fg[:, :-1]
+
+                orphan = fg & (nb == 0)
+                if not orphan.any():
+                    continue
+
+                total_removed += int(orphan.sum())
+
+                # Record unique orphan colours before zeroing
+                orphan_pixels = img[orphan]
+                for rgb_row in np.unique(orphan_pixels, axis=0):
+                    rgb = (int(rgb_row[0]), int(rgb_row[1]), int(rgb_row[2]))
+                    key = -(rgb[0] * 65536 + rgb[1] * 256 + rgb[2] + 1)
+                    self._add_swatch(key, rgb)
+
+                frames[d, fi][orphan] = 0
+                if char.frames_pal_idx is not None:
+                    char.frames_pal_idx[d, fi][orphan] = 0
+
+        self.state.character_updated.emit(self.state.selected_idx)
+        self._status_lbl.setText(
+            f"Removed {total_removed} orphan pixel(s) across all frames.")
 
     # ------------------------------------------------------------------
     # Removed-colours swatch helpers
