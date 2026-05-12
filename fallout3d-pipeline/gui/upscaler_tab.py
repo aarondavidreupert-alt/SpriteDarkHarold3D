@@ -136,6 +136,17 @@ class UpscalerTab(QWidget):
         self.state.selection_changed.connect(self._on_selection_changed)
         self.state.character_updated.connect(self._on_selection_changed)
 
+        from config import load_config
+        cfg = load_config()
+        saved_edsr = cfg.get("upscaler_edsr_path", "")
+        saved_esrgan = cfg.get("upscaler_esrgan_model", "")
+        if saved_edsr:
+            self._edsr_path.setText(saved_edsr)
+        if saved_esrgan:
+            idx = self._esrgan_combo.findData(saved_esrgan)
+            if idx >= 0:
+                self._esrgan_combo.setCurrentIndex(idx)
+
     # ── UI ────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -167,6 +178,7 @@ class UpscalerTab(QWidget):
         self._edsr_path = QLineEdit()
         self._edsr_path.setPlaceholderText("Path to EDSR_x4.pb …")
         edsr_lay.addWidget(self._edsr_path, 1)
+        self._edsr_path.editingFinished.connect(self._save_model_prefs)
         btn_browse = QPushButton("Browse…")
         btn_browse.setFixedWidth(72)
         btn_browse.clicked.connect(self._browse_edsr_model)
@@ -183,6 +195,9 @@ class UpscalerTab(QWidget):
             self._esrgan_combo.addItem(name, name)
         self._esrgan_combo.setCurrentText(REALESRGAN_DEFAULT)
         esrgan_lay.addWidget(self._esrgan_combo, 1)
+        self._esrgan_combo.currentIndexChanged.connect(
+            lambda _: self._save_model_prefs()
+        )
         self._opt_stack.addWidget(esrgan_page)
 
         # Page 2 — PyTorch: informational label only
@@ -282,6 +297,13 @@ class UpscalerTab(QWidget):
     def _on_backend_changed(self, idx: int):
         self._opt_stack.setCurrentIndex(idx)
 
+    def _save_model_prefs(self):
+        from config import load_config, save_config
+        cfg = load_config()
+        cfg["upscaler_edsr_path"]    = self._edsr_path.text().strip()
+        cfg["upscaler_esrgan_model"] = self._esrgan_combo.currentData()
+        save_config(cfg)
+
     def _browse_edsr_model(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select EDSR Model", "",
@@ -289,6 +311,7 @@ class UpscalerTab(QWidget):
         )
         if path:
             self._edsr_path.setText(path)
+            self._save_model_prefs()
 
     # ── Upscaling ─────────────────────────────────────────────────────────
 
