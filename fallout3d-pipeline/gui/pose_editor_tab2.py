@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QGroupBox, QSplitter, QSlider, QGridLayout,
     QRadioButton, QButtonGroup, QDoubleSpinBox, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QComboBox,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeyEvent, QBrush
@@ -60,6 +61,7 @@ class PoseManualEditorTab(QWidget):
         super().__init__(parent)
         self.state = state
         self._selected_dir = 0
+        self._last_placed_lm: int = 0
         self._thread: QThread | None = None
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._play_tick)
@@ -208,7 +210,56 @@ class PoseManualEditorTab(QWidget):
         self._editor_canvas = ViewCanvas(0)
         self._editor_canvas.setMinimumSize(300, 300)
         self._editor_canvas.landmark_moved.connect(self._on_editor_lm_moved)
+        self._editor_canvas.place_landmark.connect(self._on_place_landmark)
         editor_lay.addWidget(self._editor_canvas, 1)
+
+        # Place Missing Landmark
+        place_box = QGroupBox("Place Missing Landmark")
+        place_lay = QHBoxLayout(place_box)
+        place_lay.setContentsMargins(6, 2, 6, 2)
+
+        self._btn_place_mode = QPushButton("✚ Place Mode: OFF")
+        self._btn_place_mode.setCheckable(True)
+        self._btn_place_mode.setToolTip(
+            "Enable, then RIGHT-CLICK on the editor canvas\n"
+            "to place the selected landmark at that position.\n"
+            "Only affects the active direction."
+        )
+        self._btn_place_mode.toggled.connect(self._on_place_mode_toggled)
+        place_lay.addWidget(self._btn_place_mode)
+
+        place_lay.addWidget(QLabel("Landmark:"))
+
+        self._place_lm_combo = QComboBox()
+        for i, name in enumerate(_LM_NAMES):
+            side = _LM_SIDE.get(i, "center")
+            self._place_lm_combo.addItem(f"{i} — {name} ({side})", i)
+        self._place_lm_combo.setCurrentIndex(0)
+        self._place_lm_combo.setMinimumWidth(200)
+        place_lay.addWidget(self._place_lm_combo)
+
+        self._btn_place_all_frames = QPushButton("Apply to All Frames")
+        self._btn_place_all_frames.setToolTip(
+            "Copy the just-placed landmark position to all frames\n"
+            "in the active direction (useful for static joints)."
+        )
+        self._btn_place_all_frames.setEnabled(False)
+        self._btn_place_all_frames.clicked.connect(self._place_to_all_frames)
+        place_lay.addWidget(self._btn_place_all_frames)
+
+        self._btn_place_all_lm = QPushButton("Place All Landmarks")
+        self._btn_place_all_lm.setToolTip(
+            "Initialise ALL 33 landmarks for the active direction + frame\n"
+            "with a generic anatomically-plausible layout scaled to the\n"
+            "sprite's bounding box. Only places landmarks whose confidence\n"
+            "is currently 0 (i.e. not yet detected or manually placed).\n"
+            "Existing landmarks are never overwritten."
+        )
+        self._btn_place_all_lm.clicked.connect(self._place_all_landmarks)
+        place_lay.addWidget(self._btn_place_all_lm)
+
+        place_lay.addStretch()
+        editor_lay.addWidget(place_box)
 
         # Swap pairs section — 4 columns × 3 rows
         swap_box = QGroupBox("Swap Pairs")
@@ -494,6 +545,101 @@ class PoseManualEditorTab(QWidget):
         self._refresh_editor()
         self._refresh_thumbs(frame)
         self._status_lbl.setText("Flipped L/R.")
+
+    # ── Place Mode ────────────────────────────────────────────────────
+
+    def _on_place_mode_toggled(self, active: bool):
+        self._btn_place_mode.setText(
+            "✚ Place Mode: ON" if active else "✚ Place Mode: OFF")
+        self._editor_canvas._place_mode = active
+        cursor = (Qt.CursorShape.CrossCursor if active
+                  else Qt.CursorShape.ArrowCursor)
+        self._editor_canvas.viewport().setCursor(cursor)
+
+    def _on_place_landmark(self, _view_idx: int, x: float, y: float):
+        char = self.state.current_character
+        if char is None:
+            return
+        if char.poses_2d is None:
+            char.poses_2d = np.zeros((char.n_frames, 6, 33, 3), dtype=float)
+        lm_idx = self._place_lm_combo.currentData()
+        frame  = self.state.current_frame
+        d      = self._selected_dir
+        char.poses_2d[frame, d, lm_idx, 0] = x
+        char.poses_2d[frame, d, lm_idx, 1] = y
+        char.poses_2d[frame, d, lm_idx, 2] = 1.0  # manual = full confidence
+        self._last_placed_lm = lm_idx
+        self._btn_place_all_frames.setEnabled(True)
+        self._status_lbl.setText(
+            f"Placed {_LM_NAMES[lm_idx]} at ({x:.1f}, {y:.1f}) "
+            f"— Dir {d+1}, frame {frame+1}."
+        )
+        self._refresh_editor()
+        self._refresh_thumbs(frame)
+        self._populate_lm_table()
+
+    def _place_to_all_frames(self):
+        char = self.state.current_character
+        if char is None or char.poses_2d is None:
+            return
+        lm_idx = self._last_placed_lm
+        frame  = self.state.current_frame
+        d      = self._selected_dir
+        ref    = char.poses_2d[frame, d, lm_idx].copy()
+        for f in range(char.n_frames):
+            char.poses_2d[f, d, lm_idx] = ref
+        self._status_lbl.setText(
+            f"Placed {_LM_NAMES[lm_idx]} on all {char.n_frames} frames "
+            f"(Dir {d+1})."
+        )
+        self._refresh_views(frame)
+
+    _GENERIC_LM_LAYOUT: dict[int, tuple[float, float]] = {
+        0:  (0.50, 0.05), 1:  (0.46, 0.04), 2:  (0.44, 0.04),
+        3:  (0.42, 0.04), 4:  (0.54, 0.04), 5:  (0.56, 0.04),
+        6:  (0.58, 0.04), 7:  (0.42, 0.06), 8:  (0.58, 0.06),
+        9:  (0.48, 0.08), 10: (0.52, 0.08),
+        11: (0.35, 0.22), 12: (0.65, 0.22),
+        13: (0.25, 0.38), 14: (0.75, 0.38),
+        15: (0.18, 0.52), 16: (0.82, 0.52),
+        17: (0.15, 0.55), 18: (0.85, 0.55),
+        19: (0.16, 0.54), 20: (0.84, 0.54),
+        21: (0.17, 0.56), 22: (0.83, 0.56),
+        23: (0.40, 0.55), 24: (0.60, 0.55),
+        25: (0.38, 0.72), 26: (0.62, 0.72),
+        27: (0.38, 0.88), 28: (0.62, 0.88),
+        29: (0.36, 0.92), 30: (0.64, 0.92),
+        31: (0.34, 0.95), 32: (0.66, 0.95),
+    }
+
+    def _place_all_landmarks(self):
+        char = self.state.current_character
+        if char is None:
+            return
+        if char.poses_2d is None:
+            char.poses_2d = np.zeros((char.n_frames, 6, 33, 3), dtype=float)
+        frame = self.state.current_frame
+        d     = self._selected_dir
+        rect  = self._editor_canvas._scene.sceneRect()
+        W, H  = rect.width(), rect.height()
+        if W == 0 or H == 0:
+            return
+        placed = 0
+        for lm_idx, (nx, ny) in self._GENERIC_LM_LAYOUT.items():
+            if char.poses_2d[frame, d, lm_idx, 2] == 0.0:
+                char.poses_2d[frame, d, lm_idx, 0] = nx * W
+                char.poses_2d[frame, d, lm_idx, 1] = ny * H
+                char.poses_2d[frame, d, lm_idx, 2] = 0.5  # generic = half confidence
+                placed += 1
+        self._status_lbl.setText(
+            f"Placed {placed} missing landmarks generically "
+            f"(Dir {d+1}, frame {frame+1}). Drag to refine."
+        )
+        self._btn_place_all_frames.setEnabled(True)
+        self._last_placed_lm = 0
+        self._refresh_editor()
+        self._refresh_thumbs(frame)
+        self._populate_lm_table()
 
     def _save_poses(self):
         char = self.state.current_character

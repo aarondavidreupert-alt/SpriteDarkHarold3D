@@ -122,8 +122,9 @@ class LandmarkItem(QGraphicsEllipseItem):
 # -----------------------------------------------------------------------
 
 class ViewCanvas(QGraphicsView):
-    landmark_moved = pyqtSignal(int, int, float, float)  # lm_idx, view_idx, x, y
-    canvas_clicked = pyqtSignal(int)                     # view_idx
+    landmark_moved  = pyqtSignal(int, int, float, float)  # lm_idx, view_idx, x, y
+    canvas_clicked  = pyqtSignal(int)                     # view_idx
+    place_landmark  = pyqtSignal(int, float, float)       # view_idx, x, y
 
     def __init__(self, view_idx: int, parent=None):
         super().__init__(parent)
@@ -136,6 +137,7 @@ class ViewCanvas(QGraphicsView):
         self._lm_items: dict[int, LandmarkItem] = {}
         self._conn_items: list[QGraphicsLineItem] = []
         self._show_heatmap = False
+        self._place_mode: bool = False
 
         self._scene.mousePressEvent = self._scene_mouse_press
 
@@ -233,7 +235,15 @@ class ViewCanvas(QGraphicsView):
             self._conn_items.append(line)
 
     def _scene_mouse_press(self, event):
-        # Right-click on empty space → add landmark (not implemented fully)
+        if (self._place_mode
+                and event.button() == Qt.MouseButton.RightButton):
+            pos = event.scenePos()
+            items = self._scene.items(pos)
+            lm_under = any(isinstance(it, LandmarkItem) for it in items)
+            if not lm_under:
+                self.place_landmark.emit(self.view_idx, pos.x(), pos.y())
+                event.accept()
+                return
         QGraphicsScene.mousePressEvent(self._scene, event)
 
     def resizeEvent(self, event):
