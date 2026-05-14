@@ -466,6 +466,18 @@ class FrmViewerTab(QWidget):
         self._btn_clean_orphans.clicked.connect(self._remove_orphans)
         sv.addWidget(self._btn_clean_orphans)
 
+        self._btn_remove_all_listed = QPushButton("🪣 Remove All Listed Colours")
+        self._btn_remove_all_listed.setToolTip(
+            "Flood-fill erase every palette index currently shown\n"
+            "in the 'Removed colours' swatch — across ALL frames\n"
+            "and ALL directions.\n\n"
+            "Build the list first by clicking individual shadow pixels\n"
+            "with Shadow Removal mode ON, then click this button."
+        )
+        self._btn_remove_all_listed.setEnabled(False)
+        self._btn_remove_all_listed.clicked.connect(self._remove_all_listed)
+        sv.addWidget(self._btn_remove_all_listed)
+
         sv.addWidget(QLabel("Removed colours:"))
         self._swatch_scroll = QScrollArea()
         self._swatch_scroll.setWidgetResizable(True)
@@ -640,6 +652,7 @@ class FrmViewerTab(QWidget):
         chip.setText(f"#{pal_idx}" if pal_idx >= 0 else "orph")
         count = self._swatch_layout.count()
         self._swatch_layout.insertWidget(count - 1, chip)
+        self._btn_remove_all_listed.setEnabled(True)
 
     # ------------------------------------------------------------------
     # Playback
@@ -772,6 +785,52 @@ class FrmViewerTab(QWidget):
             item = self._swatch_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self._btn_remove_all_listed.setEnabled(False)
+
+    def _remove_all_listed(self):
+        char = self.state.current_character
+        if char is None or not self._removed_colors:
+            return
+        if char.frames_pal_idx is None:
+            self._status_lbl.setText(
+                "Shadow removal needs a .frm source. Re-load as .frm.")
+            return
+
+        if char.frames_backup is None:
+            char.frames_backup = char.frames.copy()
+            char.frames_pal_idx_backup = char.frames_pal_idx.copy()
+
+        target_indices = {k for k in self._removed_colors if k >= 0}
+        if not target_indices:
+            self._status_lbl.setText("No palette-indexed colours in list.")
+            return
+
+        n_dirs, n_frames = char.frames_pal_idx.shape[:2]
+        total_pixels = 0
+
+        for d in range(n_dirs):
+            for f in range(n_frames):
+                frame_pal = char.frames_pal_idx[d, f]   # (H, W) uint8
+                H, W = frame_pal.shape
+                combined_mask = np.zeros((H, W), dtype=bool)
+                for target_idx in target_indices:
+                    ys, xs = np.where(frame_pal == target_idx)
+                    for sx, sy in zip(xs.tolist(), ys.tolist()):
+                        if combined_mask[sy, sx]:
+                            continue
+                        patch = _flood_fill_mask(frame_pal, sx, sy, target_idx)
+                        combined_mask |= patch
+                if combined_mask.any():
+                    total_pixels += int(combined_mask.sum())
+                    char.frames_pal_idx[d, f][combined_mask] = 0
+                    char.frames[d, f][combined_mask] = 0
+
+        self.state.character_updated.emit(self.state.selected_idx)
+        self._status_lbl.setText(
+            f"Removed {total_pixels} pixel(s) matching "
+            f"{len(target_indices)} listed colour(s) "
+            f"across all frames and directions."
+        )
 
     # ------------------------------------------------------------------
     # Canvas recomposite
