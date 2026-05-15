@@ -181,7 +181,7 @@ class _DirCell(QFrame):
     # Frame display
     # ------------------------------------------------------------------
 
-    def set_frame(self, img: np.ndarray | None):
+    def set_frame(self, img: np.ndarray | None, fit: bool = True):
         self._last_img = img
         if img is None:
             self._pix_item.setPixmap(QPixmap())
@@ -190,7 +190,8 @@ class _DirCell(QFrame):
         pix = _to_pixmap_raw(img, bg_rgb=self._bg_rgb)
         self._pix_item.setPixmap(pix)
         self._scene.setSceneRect(QRectF(pix.rect()))
-        self._fit_in_view()
+        if fit:
+            self._fit_in_view()
 
     def _rerender_bg(self):
         if self._last_img is None:
@@ -442,6 +443,15 @@ class FrmViewerTab(QWidget):
             "with transparent (index 0).")
         self._btn_shadow_mode.toggled.connect(self._on_shadow_mode_toggled)
         sv.addWidget(self._btn_shadow_mode)
+
+        self._btn_paint_back = QPushButton("🖌 Paint Back: OFF")
+        self._btn_paint_back.setCheckable(True)
+        self._btn_paint_back.setToolTip(
+            "Click any pixel to restore it from the backup\n"
+            "(one pixel at a time — no flood fill).\n"
+            "Requires a backup to exist (make any edit first).")
+        self._btn_paint_back.toggled.connect(self._on_paint_back_toggled)
+        sv.addWidget(self._btn_paint_back)
 
         scope_row = QHBoxLayout()
         self._shadow_scope_current = QRadioButton("This frame only")
@@ -709,11 +719,45 @@ class FrmViewerTab(QWidget):
     def _on_shadow_mode_toggled(self, active: bool):
         self._btn_shadow_mode.setText(
             "🪣 Shadow Removal: ON" if active else "🪣 Shadow Removal: OFF")
+        if active and self._btn_paint_back.isChecked():
+            self._btn_paint_back.setChecked(False)
         cursor = Qt.CursorShape.CrossCursor if active else Qt.CursorShape.ArrowCursor
         for cell in self._cells:
             cell._view.viewport().setCursor(cursor)
 
+    def _on_paint_back_toggled(self, active: bool):
+        self._btn_paint_back.setText(
+            "🖌 Paint Back: ON" if active else "🖌 Paint Back: OFF")
+        if active and self._btn_shadow_mode.isChecked():
+            self._btn_shadow_mode.setChecked(False)
+        cursor = Qt.CursorShape.PointingHandCursor if active else Qt.CursorShape.ArrowCursor
+        for cell in self._cells:
+            cell._view.viewport().setCursor(cursor)
+
     def _on_pixel_clicked(self, dir_idx: int, xf: float, yf: float):
+        # Paint-back mode takes priority over shadow removal
+        if self._btn_paint_back.isChecked():
+            char = self.state.current_character
+            if char is None:
+                return
+            if char.frames_backup is None:
+                self._status_lbl.setText("No backup to restore from.")
+                return
+            fi = self.state.current_frame
+            img = char.frames[dir_idx, fi]
+            H, W = img.shape[:2]
+            px = max(0, min(int(xf * W), W - 1))
+            py = max(0, min(int(yf * H), H - 1))
+            char.frames[dir_idx, fi, py, px] = char.frames_backup[dir_idx, fi, py, px]
+            if (char.frames_pal_idx is not None
+                    and char.frames_pal_idx_backup is not None):
+                char.frames_pal_idx[dir_idx, fi, py, px] = \
+                    char.frames_pal_idx_backup[dir_idx, fi, py, px]
+            self.state.character_updated.emit(self.state.selected_idx)
+            self._status_lbl.setText(
+                f"Restored pixel ({px}, {py}) — Dir {dir_idx+1}, frame {fi+1}.")
+            return
+
         if not self._btn_shadow_mode.isChecked():
             return
         char = self.state.current_character
@@ -809,20 +853,24 @@ class FrmViewerTab(QWidget):
             self._status_lbl.setText("No palette-indexed colours in list.")
             return
 
+        # Seed from backup (current arrays may already have those pixels zeroed)
+        pal_src = char.frames_pal_idx_backup if char.frames_pal_idx_backup is not None \
+                  else char.frames_pal_idx
+
         n_dirs, n_frames = char.frames_pal_idx.shape[:2]
         total_pixels = 0
 
         for d in range(n_dirs):
             for f in range(n_frames):
-                frame_pal = char.frames_pal_idx[d, f]   # (H, W) uint8
-                H, W = frame_pal.shape
+                frame_pal_src = pal_src[d, f]        # original indices for seeding
+                H, W = frame_pal_src.shape
                 combined_mask = np.zeros((H, W), dtype=bool)
                 for target_idx in target_indices:
                     if target_idx not in self._removed_seeds:
                         continue
                     sx, sy = self._removed_seeds[target_idx]
                     if 0 <= sy < H and 0 <= sx < W:
-                        patch = _flood_fill_mask(frame_pal, sx, sy, target_idx)
+                        patch = _flood_fill_mask(frame_pal_src, sx, sy, target_idx)
                         combined_mask |= patch
                 if combined_mask.any():
                     total_pixels += int(combined_mask.sum())
@@ -942,14 +990,15 @@ class FrmViewerTab(QWidget):
             self._frame_lbl.setText("Frame — / —")
             self._status_lbl.setText("Load a character first.")
             for cell in self._cells:
-                cell.set_frame(None)
+                cell.set_frame(None, fit=True)
             return
-        self._refresh_cells(self.state.current_frame)
+        self._refresh_cells(self.state.current_frame, fit=True)
         self._refresh_status()
 
     def _on_char_updated(self, idx: int):
         if idx == self.state.selected_idx:
-            self._on_char_changed(idx)
+            self._refresh_cells(self.state.current_frame, fit=False)
+            self._refresh_status()
 
     def _on_frame_changed(self, frame: int):
         char = self.state.current_character
@@ -961,7 +1010,7 @@ class FrmViewerTab(QWidget):
     # Display helpers
     # ------------------------------------------------------------------
 
-    def _refresh_cells(self, frame_idx: int):
+    def _refresh_cells(self, frame_idx: int, fit: bool = False):
         char = self.state.current_character
         if char is None:
             return
@@ -970,9 +1019,9 @@ class FrmViewerTab(QWidget):
         self._frame_lbl.setText(f"Frame {fi + 1} / {char.n_frames}")
         for d in range(6):
             if d < n_dirs:
-                self._cells[d].set_frame(char.frames[d, fi])
+                self._cells[d].set_frame(char.frames[d, fi], fit=fit)
             else:
-                self._cells[d].set_frame(None)
+                self._cells[d].set_frame(None, fit=fit)
 
     def _refresh_status(self):
         char = self.state.current_character
