@@ -377,15 +377,24 @@ class UpscalerTab(QWidget):
         self._upscaled = result
 
         char = self.state.current_character
+        backend = self._backend_combo.currentData()
+        sidecar_msg = ""
         if char is not None:
             char.upscaled_frames = result
             self.state.character_upscaled.emit(self.state.selected_idx)
+            try:
+                from gui.sidecar import save_sidecar
+                p = save_sidecar(char, upscaled_backend=backend)
+                if p:
+                    sidecar_msg = f"  💾 {os.path.basename(p)}"
+            except Exception:
+                pass
 
         n_dirs, n_frames, out_h, out_w = result.shape[:4]
         self._frame_spin.setRange(1, n_frames)
         self._nav_info.setText(f"({n_dirs} dirs × {n_frames} frames)")
         self._status_lbl.setText(
-            f"Done — {out_w}×{out_h} px  ({n_dirs} dirs × {n_frames} frames)"
+            f"Done — {out_w}×{out_h} px  ({n_dirs} dirs × {n_frames} frames){sidecar_msg}"
         )
         self._update_preview()
 
@@ -411,10 +420,18 @@ class UpscalerTab(QWidget):
         # Auto-detect an existing cache for whichever backend is selected
         backend  = self._backend_combo.currentData()
         cache_fp = _cache_path(char, backend)
+        from gui.sidecar import sidecar_path
+        scar_fp = sidecar_path(char) or ""
         if char.upscaled_frames is not None:
-            status = "upscaled frames already loaded"
+            stored_backend = getattr(char, "_sidecar_upscaled_backend", "")
+            if stored_backend:
+                status = f"📂 upscaled loaded from sidecar ({stored_backend})"
+            else:
+                status = "upscaled frames already loaded"
+        elif scar_fp and os.path.exists(scar_fp):
+            status = f"sidecar found: {os.path.basename(scar_fp)}"
         elif os.path.exists(cache_fp):
-            status = f"cache found: {os.path.basename(cache_fp)}"
+            status = f"legacy .npy cache: {os.path.basename(cache_fp)}"
         else:
             status = "no cache — press Run to upscale"
 

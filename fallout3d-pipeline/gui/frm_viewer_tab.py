@@ -385,6 +385,9 @@ class FrmViewerTab(QWidget):
         self._brush_size = 1
         self._removed_colors: dict[int, tuple[int, int, int]] = {}
         self._removed_seeds:  dict[int, tuple[int, int]]      = {}
+        self._sidecar_timer = QTimer(self)
+        self._sidecar_timer.setSingleShot(True)
+        self._sidecar_timer.timeout.connect(self._save_sidecar)
         self._build_ui()
         self._select_dir(0)
 
@@ -729,6 +732,7 @@ class FrmViewerTab(QWidget):
         self.state.character_updated.emit(self.state.selected_idx)
         self._status_lbl.setText(
             f"Removed {total_removed} orphan pixel(s) across all frames.")
+        self._schedule_save()
 
     # ------------------------------------------------------------------
     # Removed-colours swatch helpers
@@ -922,6 +926,7 @@ class FrmViewerTab(QWidget):
                 return
             self._apply_brush_at(dir_idx, fi, px, py, H, W, "paint_back")
             self.state.character_updated.emit(self.state.selected_idx)
+            self._schedule_save()
             return
 
         if self._btn_barrier_mode.isChecked():
@@ -931,6 +936,7 @@ class FrmViewerTab(QWidget):
                     char.frames_pal_idx_backup = char.frames_pal_idx.copy()
             self._apply_brush_at(dir_idx, fi, px, py, H, W, "barrier")
             self.state.character_updated.emit(self.state.selected_idx)
+            self._schedule_save()
             return
 
         if not self._btn_shadow_mode.isChecked():
@@ -976,6 +982,7 @@ class FrmViewerTab(QWidget):
         else:
             rgb = (80, 80, 80)
         self._add_swatch(target_idx, rgb)
+        self._schedule_save()
 
     def _on_pixel_dragged(self, dir_idx: int, xf: float, yf: float):
         """Brush stroke on drag — erase/paint-back/barrier (no flood fill on drag)."""
@@ -993,6 +1000,7 @@ class FrmViewerTab(QWidget):
                 return
             self._apply_brush_at(dir_idx, fi, px, py, H, W, "paint_back")
             self.state.character_updated.emit(self.state.selected_idx)
+            self._schedule_save()
 
         elif self._btn_shadow_mode.isChecked():
             if char.frames_pal_idx is None:
@@ -1002,6 +1010,7 @@ class FrmViewerTab(QWidget):
                 char.frames_pal_idx_backup = char.frames_pal_idx.copy()
             self._apply_brush_at(dir_idx, fi, px, py, H, W, "erase")
             self.state.character_updated.emit(self.state.selected_idx)
+            self._schedule_save()
 
         elif self._btn_barrier_mode.isChecked():
             if char.frames_backup is None:
@@ -1010,6 +1019,7 @@ class FrmViewerTab(QWidget):
                     char.frames_pal_idx_backup = char.frames_pal_idx.copy()
             self._apply_brush_at(dir_idx, fi, px, py, H, W, "barrier")
             self.state.character_updated.emit(self.state.selected_idx)
+            self._schedule_save()
 
     def _on_pixel_right_clicked(self, dir_idx: int):
         """Right-click on any cell: trigger Remove All Listed Colours."""
@@ -1029,6 +1039,7 @@ class FrmViewerTab(QWidget):
             char.frames_pal_idx[:, fi] = char.frames_pal_idx_backup[:, fi]
         self.state.character_updated.emit(self.state.selected_idx)
         self._status_lbl.setText(f"Restored all directions for frame {fi + 1}.")
+        self._schedule_save()
 
     def _restore_shadow(self):
         char = self.state.current_character
@@ -1044,7 +1055,11 @@ class FrmViewerTab(QWidget):
         char.frames_backup         = None
         char.frames_pal_idx_backup = None
         self.state.character_updated.emit(self.state.selected_idx)
-        self._status_lbl.setText("Original frames restored.")
+        from gui.sidecar import delete_sidecar
+        deleted = delete_sidecar(char)
+        self._status_lbl.setText(
+            "Original frames restored." + ("  Sidecar deleted." if deleted else "")
+        )
 
         self._removed_colors.clear()
         self._removed_seeds.clear()
@@ -1114,20 +1129,75 @@ class FrmViewerTab(QWidget):
             f"{len(target_indices)} listed colour(s) "
             f"across all frames and directions."
         )
+        self._schedule_save()
 
     # ------------------------------------------------------------------
     # Canvas recomposite
     # ------------------------------------------------------------------
 
     def _on_char_added(self, idx: int):
-        """Auto-apply canvas when a new FRM character is loaded."""
+        """Auto-apply canvas when a new FRM character is loaded, then sidecar."""
         chars = self.state.characters
         char = chars[idx] if 0 <= idx < len(chars) else None
         if char is None:
             return
         src = char.source_path or ""
         if src.lower().endswith(".frm") and os.path.exists(src):
-            QTimer.singleShot(50, self._apply_canvas)
+            QTimer.singleShot(50, self._auto_load_after_canvas)
+        else:
+            QTimer.singleShot(50, self._try_load_sidecar)
+
+    def _auto_load_after_canvas(self):
+        self._apply_canvas()
+        self._try_load_sidecar()
+
+    # ------------------------------------------------------------------
+    # Sidecar persistence
+    # ------------------------------------------------------------------
+
+    def _schedule_save(self, delay_ms: int = 400):
+        self._sidecar_timer.start(delay_ms)
+
+    def _save_sidecar(self):
+        char = self.state.current_character
+        if char is None or not char.source_path:
+            return
+        from gui.sidecar import save_sidecar
+        p = save_sidecar(char)
+        if p:
+            self._status_lbl.setText(f"💾 Saved {os.path.basename(p)}")
+
+    def _clear_swatches(self):
+        self._removed_colors.clear()
+        self._removed_seeds.clear()
+        while self._swatch_layout.count() > 1:
+            item = self._swatch_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._btn_remove_all_listed.setEnabled(False)
+
+    def _try_load_sidecar(self):
+        char = self.state.current_character
+        if char is None or not char.source_path:
+            return
+        from gui.sidecar import apply_sidecar_to_char, sidecar_path
+        edits, upscaled = apply_sidecar_to_char(char)
+        if not (edits or upscaled):
+            return
+        self._clear_swatches()
+        self.state.character_updated.emit(self.state.selected_idx)
+        if upscaled:
+            self.state.character_upscaled.emit(self.state.selected_idx)
+        parts = []
+        if edits:
+            parts.append("shadow edits")
+        if upscaled:
+            parts.append("upscaled frames")
+        p = sidecar_path(char) or ""
+        self._status_lbl.setText(
+            f"📂 Loaded {' + '.join(parts)} from {os.path.basename(p)} — "
+            f"swatch history not restored."
+        )
 
     def _apply_canvas(self):
         char = self.state.current_character
@@ -1206,6 +1276,7 @@ class FrmViewerTab(QWidget):
             self._status_lbl.setText(
                 f"Recomposited at {canvas_size}×{canvas_size} px."
             )
+            self._schedule_save()
         except Exception as exc:
             self._status_lbl.setText(f"Error: {exc}")
         finally:
