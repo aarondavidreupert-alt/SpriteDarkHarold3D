@@ -1,7 +1,5 @@
 {
   "input_mode": "frm",
   "input_path": "C:/Users/aaron/OneDrive/Dokumente/GitHub/DH3D-Sprites/SpriteDarkHarold3D/example_frm/hmjmpsaa.frm",
-  "upscale": true,
-  "upscaler_edsr_path": "C:/Users/aaron/OneDrive/Dokumente/GitHub/DH3D-Sprites/SpriteDarkHarold3D/upscaler/EDSR_x4.pb",
-  "upscaler_esrgan_model": "RealESRGAN_x4plus_anime_6B"
+  "upscale": true
 }
