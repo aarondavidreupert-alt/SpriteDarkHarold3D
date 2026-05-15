@@ -1,5 +1,15 @@
 {
   "input_mode": "frm",
   "input_path": "C:/Users/aaron/OneDrive/Dokumente/GitHub/DH3D-Sprites/SpriteDarkHarold3D/example_frm/hmjmpsaa.frm",
-  "upscale": true
+  "upscale": true,
+  "frm_browser_type_checks": {
+    "HA": false,
+    "HF": false,
+    "HM": true,
+    "NA": false,
+    "NF": false,
+    "NM": false,
+    "MA": false
+  },
+  "frm_browser_folder": "C:/Users/aaron/OneDrive/Dokumente/GitHub/DarkHarold2/data/art/critters"
 }
