@@ -5,8 +5,8 @@
   "frm_browser_folder": "C:/Users/aaron/OneDrive/Dokumente/GitHub/DarkHarold2/data/art/critters",
   "frm_browser_type_checks": {
     "HA": false,
-    "HF": false,
-    "HM": true,
+    "HF": true,
+    "HM": false,
     "NA": false,
     "NF": false,
     "NM": false,
