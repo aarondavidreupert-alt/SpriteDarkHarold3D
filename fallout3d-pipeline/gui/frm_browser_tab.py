@@ -42,9 +42,11 @@ from PyQt6.QtCore import (
 
 from gui.main_window import AppState
 from pipeline.frm_catalog import FrmCatalog, FrmEntry, TYPE_CODES
+from config import load_config, save_config
 
 _logger = logging.getLogger(__name__)
 _DIR_NAMES = ["NE", "E", "SE", "SW", "W", "NW"]
+_DEFAULT_CHECKED = {"AA", "NA"}
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +258,13 @@ class FrmBrowserTab(QWidget):
         self._preview_anim_timer = QTimer(self)
         self._preview_anim_timer.timeout.connect(self._preview_tick)
 
+        cfg = load_config()
+        self._saved_checks: dict[str, bool] = cfg.get("frm_browser_type_checks", {})
         self._build_ui()
+
+        saved_folder = cfg.get("frm_browser_folder", "")
+        if saved_folder and os.path.isdir(saved_folder):
+            self.txt_folder.setText(saved_folder)
 
     # ------------------------------------------------------------------
     # UI
@@ -300,8 +308,11 @@ class FrmBrowserTab(QWidget):
         self._type_checks: dict[str, QCheckBox] = {}
         for code, label in TYPE_CODES.items():
             cb = QCheckBox(f"{code} — {label}")
-            cb.setChecked(True)
+            default = self._saved_checks.get(code, code in _DEFAULT_CHECKED)
+            cb.setChecked(default)
+            cb.setToolTip(label)
             cb.toggled.connect(self._refresh_matrix)
+            cb.toggled.connect(self._save_check_state)
             fv.addWidget(cb)
             self._type_checks[code] = cb
         v.addWidget(grp_filter)
@@ -370,6 +381,12 @@ class FrmBrowserTab(QWidget):
         self.preview_meta_lbl = QLabel("")
         self.preview_meta_lbl.setStyleSheet("color:#aaa; font-size:11px;")
         gv.addWidget(self.preview_meta_lbl)
+
+        legend_text = " · ".join(f"{code} {label}" for code, label in TYPE_CODES.items())
+        legend_lbl = QLabel(legend_text)
+        legend_lbl.setWordWrap(True)
+        legend_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        gv.addWidget(legend_lbl)
 
         # 2×3 grid of dirs
         grid_box = QFrame()
@@ -459,6 +476,9 @@ class FrmBrowserTab(QWidget):
             self._set_status("Folder not found.")
             return
         self.state.frm_folder = folder
+        cfg = load_config()
+        cfg["frm_browser_folder"] = folder
+        save_config(cfg)
         self._catalog.scan(folder)
         self._thumb_cache.clear()
         self._thumb_pending.clear()
@@ -689,6 +709,13 @@ class FrmBrowserTab(QWidget):
         self._set_status(f"Loading {self._cur_entry.filename} into pipeline…")
 
     # ------------------------------------------------------------------
+
+    def _save_check_state(self):
+        cfg = load_config()
+        cfg["frm_browser_type_checks"] = {
+            code: cb.isChecked() for code, cb in self._type_checks.items()
+        }
+        save_config(cfg)
 
     def _set_status(self, text: str):
         self.status_lbl.setText(text)
