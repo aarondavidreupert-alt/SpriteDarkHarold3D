@@ -87,7 +87,20 @@ def _flood_fill_mask_multi(grid: np.ndarray, sx: int, sy: int,
     return mask
 
 
-def _to_pixmap(img: np.ndarray, max_side: int = 220) -> QPixmap:
+def _round_brush_mask(cx: int, cy: int, H: int, W: int, size: int) -> np.ndarray:
+    """Boolean mask for a round brush of given odd diameter centred at (cx, cy)."""
+    mask = np.zeros((H, W), dtype=bool)
+    if size <= 1:
+        if 0 <= cy < H and 0 <= cx < W:
+            mask[cy, cx] = True
+        return mask
+    r = size // 2
+    y0 = max(0, cy - r);  y1 = min(H, cy + r + 1)
+    x0 = max(0, cx - r);  x1 = min(W, cx + r + 1)
+    ys = np.arange(y0, y1) - cy
+    xs = np.arange(x0, x1) - cx
+    mask[y0:y1, x0:x1] = (ys[:, None] ** 2 + xs[None, :] ** 2) <= r * r
+    return mask
     """RGB (H, W, 3) uint8 ndarray → scaled QPixmap."""
     if img.dtype != np.uint8:
         img = img.astype(np.uint8)
@@ -137,8 +150,10 @@ def _to_pixmap_raw(
 
 class _DirCell(QFrame):
     """One cell in the 2×3 grid.  Shows current frame for one direction."""
-    selected_signal = pyqtSignal(int)               # dir_idx
-    pixel_clicked   = pyqtSignal(int, float, float) # dir_idx, x_frac, y_frac
+    selected_signal    = pyqtSignal(int)               # dir_idx
+    pixel_clicked      = pyqtSignal(int, float, float) # dir_idx, x_frac, y_frac
+    pixel_dragged      = pyqtSignal(int, float, float) # dir_idx, x_frac, y_frac (drag)
+    pixel_right_clicked = pyqtSignal(int)              # dir_idx
 
     def __init__(self, dir_idx: int, parent=None):
         super().__init__(parent)
@@ -181,6 +196,7 @@ class _DirCell(QFrame):
         self._MAX_ZOOM    = 16.0
         self._pan_active  = False
         self._pan_start   = None
+        self._left_down   = False
 
         self._view.viewport().installEventFilter(self)
         self._view.viewport().setMouseTracking(True)
@@ -285,15 +301,25 @@ class _DirCell(QFrame):
             self._view.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             return True
 
-        # ── mouse move → pan ──────────────────────────────────────────
-        if etype == QEvent.Type.MouseMove and self._pan_active:
-            delta = event.position().toPoint() - self._pan_start
-            self._pan_start = event.position().toPoint()
-            self._view.translate(
-                delta.x() / self._zoom_factor,
-                delta.y() / self._zoom_factor,
-            )
-            return True
+        # ── mouse move → pan OR brush drag ────────────────────────────
+        if etype == QEvent.Type.MouseMove:
+            if self._pan_active:
+                delta = event.position().toPoint() - self._pan_start
+                self._pan_start = event.position().toPoint()
+                self._view.translate(
+                    delta.x() / self._zoom_factor,
+                    delta.y() / self._zoom_factor,
+                )
+                return True
+            if self._left_down:
+                vp_pt    = event.position().toPoint()
+                scene_pt = self._view.mapToScene(vp_pt)
+                sr       = self._scene.sceneRect()
+                if sr.width() > 0 and sr.height() > 0:
+                    xf = max(0.0, min(1.0, scene_pt.x() / sr.width()))
+                    yf = max(0.0, min(1.0, scene_pt.y() / sr.height()))
+                    self.pixel_dragged.emit(self.dir_idx, xf, yf)
+                return False
 
         # ── middle-button release → stop pan ──────────────────────────
         if (etype == QEvent.Type.MouseButtonRelease
@@ -302,15 +328,29 @@ class _DirCell(QFrame):
             self._view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
             return True
 
+        # ── left release → end brush stroke ───────────────────────────
+        if (etype == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton):
+            self._left_down = False
+            return False
+
         # ── double left-click → reset zoom ────────────────────────────
         if (etype == QEvent.Type.MouseButtonDblClick
                 and event.button() == Qt.MouseButton.LeftButton):
+            self._left_down = False
             self._fit_in_view()
+            return True
+
+        # ── right-click → context action ──────────────────────────────
+        if (etype == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.RightButton):
+            self.pixel_right_clicked.emit(self.dir_idx)
             return True
 
         # ── left-click → select cell + pixel_clicked ──────────────────
         if (etype == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.MouseButton.LeftButton):
+            self._left_down = True
             self.selected_signal.emit(self.dir_idx)
             vp_pt = event.position().toPoint()
             scene_pt = self._view.mapToScene(vp_pt)
@@ -342,10 +382,11 @@ class FrmViewerTab(QWidget):
         self._selected_dir = 0
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._play_tick)
-        self._build_ui()
-        self._select_dir(0)
+        self._brush_size = 1
         self._removed_colors: dict[int, tuple[int, int, int]] = {}
         self._removed_seeds:  dict[int, tuple[int, int]]      = {}
+        self._build_ui()
+        self._select_dir(0)
 
         self.state.selection_changed.connect(self._on_char_changed)
         self.state.frame_changed.connect(self._on_frame_changed)
@@ -466,22 +507,46 @@ class FrmViewerTab(QWidget):
         shadow_box = QGroupBox("Shadow Removal")
         sv = QVBoxLayout(shadow_box)
 
+        # Brush size
+        brush_row = QHBoxLayout()
+        brush_row.addWidget(QLabel("Brush:"))
+        self._brush_btns: list[QPushButton] = []
+        for size in (1, 3, 5, 7, 9):
+            btn = QPushButton(str(size))
+            btn.setCheckable(True)
+            btn.setFixedWidth(28)
+            btn.setFixedHeight(22)
+            btn.clicked.connect(lambda _c, s=size: self._set_brush_size(s))
+            brush_row.addWidget(btn)
+            self._brush_btns.append(btn)
+        self._brush_btns[0].setChecked(True)
+        brush_row.addStretch()
+        sv.addLayout(brush_row)
+
         self._btn_shadow_mode = QPushButton("🪣 Shadow Removal: OFF")
         self._btn_shadow_mode.setCheckable(True)
         self._btn_shadow_mode.setToolTip(
-            "Click a shadow pixel on any frame to flood-fill it\n"
-            "with transparent (index 0).")
+            "Left-click: flood-fill a shadow pixel (adds to colour list).\n"
+            "Left-drag: brush-erase pixels directly.\n"
+            "Right-click anywhere: Remove All Listed Colours.")
         self._btn_shadow_mode.toggled.connect(self._on_shadow_mode_toggled)
         sv.addWidget(self._btn_shadow_mode)
 
         self._btn_paint_back = QPushButton("🖌 Paint Back: OFF")
         self._btn_paint_back.setCheckable(True)
         self._btn_paint_back.setToolTip(
-            "Click any pixel to restore it from the backup\n"
-            "(one pixel at a time — no flood fill).\n"
+            "Click or drag to restore pixels from backup with the round brush.\n"
             "Requires a backup to exist (make any edit first).")
         self._btn_paint_back.toggled.connect(self._on_paint_back_toggled)
         sv.addWidget(self._btn_paint_back)
+
+        self._btn_barrier_mode = QPushButton("🚧 Barrier: OFF")
+        self._btn_barrier_mode.setCheckable(True)
+        self._btn_barrier_mode.setToolTip(
+            "Paint zero-index barrier pixels that flood fill will not cross.\n"
+            "Draw a line across the shadow boundary before running fill.")
+        self._btn_barrier_mode.toggled.connect(self._on_barrier_mode_toggled)
+        sv.addWidget(self._btn_barrier_mode)
 
         scope_row = QHBoxLayout()
         self._shadow_scope_current = QRadioButton("This frame only")
@@ -495,9 +560,17 @@ class FrmViewerTab(QWidget):
         scope_row.addStretch()
         sv.addLayout(scope_row)
 
-        self._btn_shadow_restore = QPushButton("↩ Restore Original")
+        restore_row = QHBoxLayout()
+        self._btn_shadow_restore = QPushButton("↩ Restore All")
+        self._btn_shadow_restore.setToolTip("Restore all frames and directions from backup.")
         self._btn_shadow_restore.clicked.connect(self._restore_shadow)
-        sv.addWidget(self._btn_shadow_restore)
+        restore_row.addWidget(self._btn_shadow_restore)
+        self._btn_restore_frame = QPushButton("↩ This Frame")
+        self._btn_restore_frame.setToolTip(
+            "Restore only the current frame (all directions) from backup.")
+        self._btn_restore_frame.clicked.connect(self._restore_current_frame)
+        restore_row.addWidget(self._btn_restore_frame)
+        sv.addLayout(restore_row)
 
         self._btn_clean_orphans = QPushButton("✦ Remove Orphan Pixels")
         self._btn_clean_orphans.setToolTip(
@@ -509,12 +582,10 @@ class FrmViewerTab(QWidget):
 
         self._btn_remove_all_listed = QPushButton("🪣 Remove All Listed Colours")
         self._btn_remove_all_listed.setToolTip(
-            "Flood-fill erase every palette index currently shown\n"
-            "in the 'Removed colours' swatch — across ALL frames\n"
-            "and ALL directions.\n\n"
-            "Build the list first by clicking individual shadow pixels\n"
-            "with Shadow Removal mode ON, then click this button."
-        )
+            "Multi-index flood-fill erase every palette index in the list,\n"
+            "across ALL frames and ALL directions.\n"
+            "Barriers (🚧) painted on the live image are respected.\n\n"
+            "Shortcut: right-click any cell with Shadow Removal mode ON.")
         self._btn_remove_all_listed.setEnabled(False)
         self._btn_remove_all_listed.clicked.connect(self._remove_all_listed)
         sv.addWidget(self._btn_remove_all_listed)
@@ -579,6 +650,8 @@ class FrmViewerTab(QWidget):
             cell = _DirCell(i)
             cell.selected_signal.connect(self._select_dir)
             cell.pixel_clicked.connect(self._on_pixel_clicked)
+            cell.pixel_dragged.connect(self._on_pixel_dragged)
+            cell.pixel_right_clicked.connect(self._on_pixel_right_clicked)
             grid.addWidget(cell, i // 3, i % 3)
             self._cells.append(cell)
 
@@ -746,11 +819,19 @@ class FrmViewerTab(QWidget):
     # Shadow removal (paint-bucket flood fill)
     # ------------------------------------------------------------------
 
+    def _set_brush_size(self, size: int):
+        self._brush_size = size
+        for btn in self._brush_btns:
+            btn.setChecked(int(btn.text()) == size)
+
     def _on_shadow_mode_toggled(self, active: bool):
         self._btn_shadow_mode.setText(
             "🪣 Shadow Removal: ON" if active else "🪣 Shadow Removal: OFF")
-        if active and self._btn_paint_back.isChecked():
-            self._btn_paint_back.setChecked(False)
+        if active:
+            if self._btn_paint_back.isChecked():
+                self._btn_paint_back.setChecked(False)
+            if self._btn_barrier_mode.isChecked():
+                self._btn_barrier_mode.setChecked(False)
         cursor = Qt.CursorShape.CrossCursor if active else Qt.CursorShape.ArrowCursor
         for cell in self._cells:
             cell._view.viewport().setCursor(cursor)
@@ -758,51 +839,108 @@ class FrmViewerTab(QWidget):
     def _on_paint_back_toggled(self, active: bool):
         self._btn_paint_back.setText(
             "🖌 Paint Back: ON" if active else "🖌 Paint Back: OFF")
-        if active and self._btn_shadow_mode.isChecked():
-            self._btn_shadow_mode.setChecked(False)
+        if active:
+            if self._btn_shadow_mode.isChecked():
+                self._btn_shadow_mode.setChecked(False)
+            if self._btn_barrier_mode.isChecked():
+                self._btn_barrier_mode.setChecked(False)
         cursor = Qt.CursorShape.PointingHandCursor if active else Qt.CursorShape.ArrowCursor
         for cell in self._cells:
             cell._view.viewport().setCursor(cursor)
 
-    def _on_pixel_clicked(self, dir_idx: int, xf: float, yf: float):
-        # Paint-back mode takes priority over shadow removal
-        if self._btn_paint_back.isChecked():
-            char = self.state.current_character
-            if char is None:
+    def _on_barrier_mode_toggled(self, active: bool):
+        self._btn_barrier_mode.setText(
+            "🚧 Barrier: ON" if active else "🚧 Barrier: OFF")
+        if active:
+            if self._btn_shadow_mode.isChecked():
+                self._btn_shadow_mode.setChecked(False)
+            if self._btn_paint_back.isChecked():
+                self._btn_paint_back.setChecked(False)
+        cursor = Qt.CursorShape.CrossCursor if active else Qt.CursorShape.ArrowCursor
+        for cell in self._cells:
+            cell._view.viewport().setCursor(cursor)
+
+    # ------------------------------------------------------------------
+    # Pixel coordinate helper
+    # ------------------------------------------------------------------
+
+    def _xf_yf_to_px_py(self, dir_idx: int, xf: float, yf: float,
+                         fi: int) -> tuple[int, int, int, int] | None:
+        """Convert fractional coords to pixel (px, py) and return (px, py, H, W)."""
+        char = self.state.current_character
+        if char is None:
+            return None
+        img = char.frames[dir_idx, fi]
+        H, W = img.shape[:2]
+        px = max(0, min(int(xf * W), W - 1))
+        py = max(0, min(int(yf * H), H - 1))
+        return px, py, H, W
+
+    # ------------------------------------------------------------------
+    # Brush application
+    # ------------------------------------------------------------------
+
+    def _apply_brush_at(self, dir_idx: int, fi: int,
+                        px: int, py: int, H: int, W: int, mode: str):
+        """Apply round brush in 'erase', 'paint_back', or 'barrier' mode."""
+        char = self.state.current_character
+        if char is None:
+            return
+        mask = _round_brush_mask(px, py, H, W, self._brush_size)
+        if not mask.any():
+            return
+        if mode in ("erase", "barrier"):
+            char.frames[dir_idx, fi][mask] = 0
+            if char.frames_pal_idx is not None:
+                char.frames_pal_idx[dir_idx, fi][mask] = 0
+        elif mode == "paint_back":
+            if char.frames_backup is None:
                 return
+            char.frames[dir_idx, fi][mask] = char.frames_backup[dir_idx, fi][mask]
+            if (char.frames_pal_idx is not None
+                    and char.frames_pal_idx_backup is not None):
+                char.frames_pal_idx[dir_idx, fi][mask] = \
+                    char.frames_pal_idx_backup[dir_idx, fi][mask]
+
+    # ------------------------------------------------------------------
+    # Click and drag handlers
+    # ------------------------------------------------------------------
+
+    def _on_pixel_clicked(self, dir_idx: int, xf: float, yf: float):
+        char = self.state.current_character
+        if char is None:
+            return
+        fi = self.state.current_frame
+        coords = self._xf_yf_to_px_py(dir_idx, xf, yf, fi)
+        if coords is None:
+            return
+        px, py, H, W = coords
+
+        if self._btn_paint_back.isChecked():
             if char.frames_backup is None:
                 self._status_lbl.setText("No backup to restore from.")
                 return
-            fi = self.state.current_frame
-            img = char.frames[dir_idx, fi]
-            H, W = img.shape[:2]
-            px = max(0, min(int(xf * W), W - 1))
-            py = max(0, min(int(yf * H), H - 1))
-            char.frames[dir_idx, fi, py, px] = char.frames_backup[dir_idx, fi, py, px]
-            if (char.frames_pal_idx is not None
-                    and char.frames_pal_idx_backup is not None):
-                char.frames_pal_idx[dir_idx, fi, py, px] = \
-                    char.frames_pal_idx_backup[dir_idx, fi, py, px]
+            self._apply_brush_at(dir_idx, fi, px, py, H, W, "paint_back")
             self.state.character_updated.emit(self.state.selected_idx)
-            self._status_lbl.setText(
-                f"Restored pixel ({px}, {py}) — Dir {dir_idx+1}, frame {fi+1}.")
+            return
+
+        if self._btn_barrier_mode.isChecked():
+            if char.frames_backup is None:
+                char.frames_backup = char.frames.copy()
+                if char.frames_pal_idx is not None:
+                    char.frames_pal_idx_backup = char.frames_pal_idx.copy()
+            self._apply_brush_at(dir_idx, fi, px, py, H, W, "barrier")
+            self.state.character_updated.emit(self.state.selected_idx)
             return
 
         if not self._btn_shadow_mode.isChecked():
-            return
-        char = self.state.current_character
-        if char is None:
             return
         if char.frames_pal_idx is None:
             self._status_lbl.setText(
                 "Shadow removal needs a .frm source. Re-load as .frm.")
             return
 
-        fi = self.state.current_frame
-        frame_pal = char.frames_pal_idx[dir_idx, fi]   # (H, W) uint8
-        H, W = frame_pal.shape
-        px = max(0, min(int(xf * W), W - 1))
-        py = max(0, min(int(yf * H), H - 1))
+        frame_pal = char.frames_pal_idx[dir_idx, fi]
         target_idx = int(frame_pal[py, px])
         if target_idx == 0:
             self._status_lbl.setText("Clicked background (index 0) — nothing to do.")
@@ -810,7 +948,6 @@ class FrmViewerTab(QWidget):
 
         self._removed_seeds[target_idx] = (px, py)
 
-        # Backup before first modification
         if char.frames_backup is None:
             char.frames_backup         = char.frames.copy()
             char.frames_pal_idx_backup = char.frames_pal_idx.copy()
@@ -827,12 +964,11 @@ class FrmViewerTab(QWidget):
             if not mask.any():
                 continue
             char.frames_pal_idx[d, f][mask] = 0
-            char.frames[d, f][mask] = 0   # black in RGB
+            char.frames[d, f][mask] = 0
 
         scope = "all frames" if self._shadow_scope_all.isChecked() else "this frame"
         self.state.character_updated.emit(self.state.selected_idx)
-        self._status_lbl.setText(
-            f"Removed palette index {target_idx} ({scope}).")
+        self._status_lbl.setText(f"Removed palette index {target_idx} ({scope}).")
 
         pal_table = self._get_pal_table()
         if pal_table is not None and target_idx < len(pal_table):
@@ -840,6 +976,59 @@ class FrmViewerTab(QWidget):
         else:
             rgb = (80, 80, 80)
         self._add_swatch(target_idx, rgb)
+
+    def _on_pixel_dragged(self, dir_idx: int, xf: float, yf: float):
+        """Brush stroke on drag — erase/paint-back/barrier (no flood fill on drag)."""
+        char = self.state.current_character
+        if char is None:
+            return
+        fi = self.state.current_frame
+        coords = self._xf_yf_to_px_py(dir_idx, xf, yf, fi)
+        if coords is None:
+            return
+        px, py, H, W = coords
+
+        if self._btn_paint_back.isChecked():
+            if char.frames_backup is None:
+                return
+            self._apply_brush_at(dir_idx, fi, px, py, H, W, "paint_back")
+            self.state.character_updated.emit(self.state.selected_idx)
+
+        elif self._btn_shadow_mode.isChecked():
+            if char.frames_pal_idx is None:
+                return
+            if char.frames_backup is None:
+                char.frames_backup         = char.frames.copy()
+                char.frames_pal_idx_backup = char.frames_pal_idx.copy()
+            self._apply_brush_at(dir_idx, fi, px, py, H, W, "erase")
+            self.state.character_updated.emit(self.state.selected_idx)
+
+        elif self._btn_barrier_mode.isChecked():
+            if char.frames_backup is None:
+                char.frames_backup = char.frames.copy()
+                if char.frames_pal_idx is not None:
+                    char.frames_pal_idx_backup = char.frames_pal_idx.copy()
+            self._apply_brush_at(dir_idx, fi, px, py, H, W, "barrier")
+            self.state.character_updated.emit(self.state.selected_idx)
+
+    def _on_pixel_right_clicked(self, dir_idx: int):
+        """Right-click on any cell: trigger Remove All Listed Colours."""
+        self._remove_all_listed()
+
+    def _restore_current_frame(self):
+        char = self.state.current_character
+        if char is None:
+            self._status_lbl.setText("No character loaded.")
+            return
+        if char.frames_backup is None:
+            self._status_lbl.setText("No backup available.")
+            return
+        fi = self.state.current_frame
+        char.frames[:, fi] = char.frames_backup[:, fi]
+        if char.frames_pal_idx is not None and char.frames_pal_idx_backup is not None:
+            char.frames_pal_idx[:, fi] = char.frames_pal_idx_backup[:, fi]
+        self.state.character_updated.emit(self.state.selected_idx)
+        self._status_lbl.setText(f"Restored all directions for frame {fi + 1}.")
 
     def _restore_shadow(self):
         char = self.state.current_character
@@ -883,33 +1072,40 @@ class FrmViewerTab(QWidget):
             self._status_lbl.setText("No palette-indexed colours in list.")
             return
 
-        # Flood-fill from the originally-clicked seeds against the backup
-        # palette array (current array may already be zeroed at click sites),
-        # expanding across ANY pixel whose index is in target_indices. This
-        # captures the full connected shadow region even when it spans
-        # multiple palette indices, while leaving same-indexed pixels in
-        # unconnected parts of the sprite untouched.
-        pal_src = char.frames_pal_idx_backup if char.frames_pal_idx_backup is not None \
-                  else char.frames_pal_idx
+        # Flood-fill on the LIVE palette array so that barrier pixels
+        # (index=0 painted by the user) stop the fill. The original click
+        # zeroed the seed pixel, so we temporarily restore it to allow the
+        # fill to start, then immediately put it back (the fill mask will
+        # clear it anyway). Seeds whose backup value is not in target_indices
+        # are skipped for a given frame (sprite shifted so seed isn't shadow).
+        pal_live   = char.frames_pal_idx
+        pal_backup = char.frames_pal_idx_backup
 
-        n_dirs, n_frames = char.frames_pal_idx.shape[:2]
+        n_dirs, n_frames = pal_live.shape[:2]
         total_pixels = 0
 
         for d in range(n_dirs):
             for f in range(n_frames):
-                frame_pal_src = pal_src[d, f]
-                H, W = frame_pal_src.shape
+                frame_live = pal_live[d, f]
+                H, W = frame_live.shape
                 mask = np.zeros((H, W), dtype=bool)
                 for target_idx, (sx, sy) in self._removed_seeds.items():
                     if target_idx not in target_indices:
                         continue
                     if not (0 <= sx < W and 0 <= sy < H):
                         continue
+                    # Skip if backup confirms seed wasn't shadow on this frame
+                    if (pal_backup is not None
+                            and int(pal_backup[d, f, sy, sx]) not in target_indices):
+                        continue
+                    saved = int(frame_live[sy, sx])
+                    frame_live[sy, sx] = target_idx   # temp restore for seeding
                     _flood_fill_mask_multi(
-                        frame_pal_src, sx, sy, target_indices, seed_mask=mask)
+                        frame_live, sx, sy, target_indices, seed_mask=mask)
+                    frame_live[sy, sx] = saved        # put back (mask clears it)
                 if mask.any():
                     total_pixels += int(mask.sum())
-                    char.frames_pal_idx[d, f][mask] = 0
+                    pal_live[d, f][mask] = 0
                     char.frames[d, f][mask] = 0
 
         self.state.character_updated.emit(self.state.selected_idx)
