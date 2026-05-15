@@ -848,34 +848,23 @@ class FrmViewerTab(QWidget):
             char.frames_backup = char.frames.copy()
             char.frames_pal_idx_backup = char.frames_pal_idx.copy()
 
-        target_indices = {k for k in self._removed_colors if k >= 0}
+        target_indices = sorted({k for k in self._removed_colors if k >= 0})
         if not target_indices:
             self._status_lbl.setText("No palette-indexed colours in list.")
             return
 
-        # Seed from backup (current arrays may already have those pixels zeroed)
-        pal_src = char.frames_pal_idx_backup if char.frames_pal_idx_backup is not None \
-                  else char.frames_pal_idx
-
+        targets_arr = np.array(target_indices, dtype=char.frames_pal_idx.dtype)
         n_dirs, n_frames = char.frames_pal_idx.shape[:2]
         total_pixels = 0
 
         for d in range(n_dirs):
             for f in range(n_frames):
-                frame_pal_src = pal_src[d, f]        # original indices for seeding
-                H, W = frame_pal_src.shape
-                combined_mask = np.zeros((H, W), dtype=bool)
-                for target_idx in target_indices:
-                    if target_idx not in self._removed_seeds:
-                        continue
-                    sx, sy = self._removed_seeds[target_idx]
-                    if 0 <= sy < H and 0 <= sx < W:
-                        patch = _flood_fill_mask(frame_pal_src, sx, sy, target_idx)
-                        combined_mask |= patch
-                if combined_mask.any():
-                    total_pixels += int(combined_mask.sum())
-                    char.frames_pal_idx[d, f][combined_mask] = 0
-                    char.frames[d, f][combined_mask] = 0
+                frame_pal = char.frames_pal_idx[d, f]
+                mask = np.isin(frame_pal, targets_arr)
+                if mask.any():
+                    total_pixels += int(mask.sum())
+                    char.frames_pal_idx[d, f][mask] = 0
+                    char.frames[d, f][mask] = 0
 
         self.state.character_updated.emit(self.state.selected_idx)
         self._status_lbl.setText(
