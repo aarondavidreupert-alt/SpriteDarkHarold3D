@@ -314,6 +314,7 @@ class FrmViewerTab(QWidget):
         self._build_ui()
         self._select_dir(0)
         self._removed_colors: dict[int, tuple[int, int, int]] = {}
+        self._removed_seeds:  dict[int, tuple[int, int]]      = {}
 
         self.state.selection_changed.connect(self._on_char_changed)
         self.state.frame_changed.connect(self._on_frame_changed)
@@ -733,6 +734,8 @@ class FrmViewerTab(QWidget):
             self._status_lbl.setText("Clicked background (index 0) — nothing to do.")
             return
 
+        self._removed_seeds[target_idx] = (px, py)
+
         # Backup before first modification
         if char.frames_backup is None:
             char.frames_backup         = char.frames.copy()
@@ -781,6 +784,7 @@ class FrmViewerTab(QWidget):
         self._status_lbl.setText("Original frames restored.")
 
         self._removed_colors.clear()
+        self._removed_seeds.clear()
         while self._swatch_layout.count() > 1:
             item = self._swatch_layout.takeAt(0)
             if item.widget():
@@ -814,10 +818,10 @@ class FrmViewerTab(QWidget):
                 H, W = frame_pal.shape
                 combined_mask = np.zeros((H, W), dtype=bool)
                 for target_idx in target_indices:
-                    ys, xs = np.where(frame_pal == target_idx)
-                    for sx, sy in zip(xs.tolist(), ys.tolist()):
-                        if combined_mask[sy, sx]:
-                            continue
+                    if target_idx not in self._removed_seeds:
+                        continue
+                    sx, sy = self._removed_seeds[target_idx]
+                    if 0 <= sy < H and 0 <= sx < W:
                         patch = _flood_fill_mask(frame_pal, sx, sy, target_idx)
                         combined_mask |= patch
                 if combined_mask.any():
