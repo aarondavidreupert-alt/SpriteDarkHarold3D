@@ -57,6 +57,36 @@ def _flood_fill_mask(grid: np.ndarray, sx: int, sy: int,
     return mask
 
 
+def _flood_fill_mask_multi(grid: np.ndarray, sx: int, sy: int,
+                           targets: set[int],
+                           seed_mask: np.ndarray | None = None) -> np.ndarray:
+    """
+    4-connected flood fill that expands across ANY pixel whose value is in
+    `targets`. Returns a boolean mask of pixels reachable from (sx, sy).
+    If `seed_mask` is given, the fill is also accumulated into it (in-place)
+    and pixels already True in seed_mask are skipped.
+    """
+    H, W = grid.shape
+    if seed_mask is None:
+        mask = np.zeros((H, W), dtype=bool)
+    else:
+        mask = seed_mask
+    if not (0 <= sx < W and 0 <= sy < H):
+        return mask
+    if int(grid[sy, sx]) not in targets or mask[sy, sx]:
+        return mask
+    stack = [(sx, sy)]
+    while stack:
+        x, y = stack.pop()
+        if x < 0 or x >= W or y < 0 or y >= H:
+            continue
+        if mask[y, x] or int(grid[y, x]) not in targets:
+            continue
+        mask[y, x] = True
+        stack.extend([(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)])
+    return mask
+
+
 def _to_pixmap(img: np.ndarray, max_side: int = 220) -> QPixmap:
     """RGB (H, W, 3) uint8 ndarray → scaled QPixmap."""
     if img.dtype != np.uint8:
@@ -853,7 +883,12 @@ class FrmViewerTab(QWidget):
             self._status_lbl.setText("No palette-indexed colours in list.")
             return
 
-        # Seed from backup (current arrays may already have those pixels zeroed)
+        # Flood-fill from the originally-clicked seeds against the backup
+        # palette array (current array may already be zeroed at click sites),
+        # expanding across ANY pixel whose index is in target_indices. This
+        # captures the full connected shadow region even when it spans
+        # multiple palette indices, while leaving same-indexed pixels in
+        # unconnected parts of the sprite untouched.
         pal_src = char.frames_pal_idx_backup if char.frames_pal_idx_backup is not None \
                   else char.frames_pal_idx
 
@@ -862,20 +897,20 @@ class FrmViewerTab(QWidget):
 
         for d in range(n_dirs):
             for f in range(n_frames):
-                frame_pal_src = pal_src[d, f]        # original indices for seeding
+                frame_pal_src = pal_src[d, f]
                 H, W = frame_pal_src.shape
-                combined_mask = np.zeros((H, W), dtype=bool)
-                for target_idx in target_indices:
-                    if target_idx not in self._removed_seeds:
+                mask = np.zeros((H, W), dtype=bool)
+                for target_idx, (sx, sy) in self._removed_seeds.items():
+                    if target_idx not in target_indices:
                         continue
-                    sx, sy = self._removed_seeds[target_idx]
-                    if 0 <= sy < H and 0 <= sx < W:
-                        patch = _flood_fill_mask(frame_pal_src, sx, sy, target_idx)
-                        combined_mask |= patch
-                if combined_mask.any():
-                    total_pixels += int(combined_mask.sum())
-                    char.frames_pal_idx[d, f][combined_mask] = 0
-                    char.frames[d, f][combined_mask] = 0
+                    if not (0 <= sx < W and 0 <= sy < H):
+                        continue
+                    _flood_fill_mask_multi(
+                        frame_pal_src, sx, sy, target_indices, seed_mask=mask)
+                if mask.any():
+                    total_pixels += int(mask.sum())
+                    char.frames_pal_idx[d, f][mask] = 0
+                    char.frames[d, f][mask] = 0
 
         self.state.character_updated.emit(self.state.selected_idx)
         self._status_lbl.setText(
